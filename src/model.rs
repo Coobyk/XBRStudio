@@ -171,9 +171,6 @@ fn collect_entity_faces(
 ) {
     for cube in &part.cubes {
         let [dx, dy, dz] = cube.size;
-        if dx <= 0.0 || dy <= 0.0 || dz <= 0.0 {
-            continue;
-        }
         let (u, v) = (cube.uv[0], cube.uv[1]);
         let u0 = u;
         let u1 = u + dz;
@@ -182,9 +179,10 @@ fn collect_entity_faces(
         let v0 = v;
         let v1 = v + dz;
 
-        let group = *group_counter;
-        *group_counter += 1;
-
+        // Flat cubes (any dimension ≤ 0) still have non-degenerate faces:
+        // dy=0 keeps up/down (w=dx, h=dz), dx=0 keeps east/west, dz=0 keeps
+        // north/south. Emit only the faces with positive area instead of
+        // skipping the whole cube (frog tongue/feet, bat wings, fish fins, …).
         let rects = [
             ("down", u1, v0, dx, dz),
             ("up", u2, v0, dx, dz),
@@ -194,7 +192,16 @@ fn collect_entity_faces(
             ("south", u3, v1, dx, dy),
         ];
 
+        let mut emitted = false;
+        let group = *group_counter;
         for (face_name, x, y, w, h) in rects {
+            if w <= 0.0 || h <= 0.0 {
+                continue;
+            }
+            if !emitted {
+                *group_counter += 1;
+                emitted = true;
+            }
             out.push(ModelFace {
                 texture: first_texture_reference(textures).unwrap_or_default(),
                 rect: FaceRect {
@@ -453,5 +460,71 @@ mod tests {
         let groups: std::collections::HashSet<u32> =
             parsed.faces.iter().map(|face| face.group).collect();
         assert_eq!(groups, [0, 1].into_iter().collect());
+    }
+
+    #[test]
+    fn flat_cube_emits_non_degenerate_faces() {
+        // Frog-style dy=0 plate: only up/down have area (w=dx, h=dz).
+        let entity = json!({
+            "texture_size": [48, 48],
+            "parts": [{
+                "name": "tongue",
+                "cubes": [{
+                    "origin": [-2.0, 0.0, -7.1],
+                    "size": [4.0, 0.0, 7.0],
+                    "uv": [17.0, 13.0]
+                }]
+            }]
+        });
+        let parsed = parse_model(&entity).unwrap();
+        assert_eq!(parsed.faces.len(), 2, "dy=0 cube should emit up+down only");
+        let down = parsed
+            .faces
+            .iter()
+            .find(|face| face.face == "down")
+            .expect("down face");
+        let up = parsed
+            .faces
+            .iter()
+            .find(|face| face.face == "up")
+            .expect("up face");
+        // dx=4, dz=7, uv(17,13): down at (u+dz, v)=(24,13) size 4×7;
+        // up at (u+dz+dx, v)=(28,13) size 4×7.
+        assert_eq!(
+            down.rect,
+            FaceRect { x: 24, y: 13, width: 4, height: 7 }
+        );
+        assert_eq!(
+            up.rect,
+            FaceRect { x: 28, y: 13, width: 4, height: 7 }
+        );
+        assert_eq!(down.group, up.group);
+
+        // dx=0 slab: only east/west have area (w=dz, h=dy).
+        let entity = json!({
+            "texture_size": [64, 64],
+            "parts": [{
+                "name": "wing",
+                "cubes": [{
+                    "origin": [0.0, 0.0, 0.0],
+                    "size": [0.0, 5.0, 8.0],
+                    "uv": [16.0, 0.0]
+                }]
+            }]
+        });
+        let parsed = parse_model(&entity).unwrap();
+        let names: Vec<&str> = parsed.faces.iter().map(|face| face.face.as_str()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"east") && names.contains(&"west"));
+        let east = parsed
+            .faces
+            .iter()
+            .find(|face| face.face == "east")
+            .unwrap();
+        // uv(16,0), dz=8, dy=5: east at (u+dz+dx, v+dz)=(24, 8) size 8×5.
+        assert_eq!(
+            east.rect,
+            FaceRect { x: 24, y: 8, width: 8, height: 5 }
+        );
     }
 }
