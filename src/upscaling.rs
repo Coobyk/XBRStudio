@@ -477,8 +477,9 @@ pub fn face_border_tile(
     Ok(build_padded_tile(source, face, &group, border))
 }
 
-/// Plain whole-image xBRZ base, then each face is replaced by its own
-/// neighbor-bordered tile (upscaled, border cropped) at `rect × factor`.
+/// Empty canvas; each face is pasted as its own neighbor-bordered tile
+/// (upscaled, border cropped) at `rect × factor`. Uncovered atlas pixels
+/// stay transparent — no plain-xBRZ base under the faces.
 fn upscale_box_faces(
     image: &RgbaImage,
     faces: &[ModelFace],
@@ -491,13 +492,6 @@ fn upscale_box_faces(
     );
 
     let mut output = RgbaImage::from_pixel(output_width, output_height, Rgba([0, 0, 0, 0]));
-    let base = scale_rgba(
-        image.as_raw(),
-        source_width as usize,
-        source_height as usize,
-        factor as usize,
-    );
-    copy_rgba_buffer(&mut output, &base);
 
     let mut boxes: HashMap<u32, Vec<usize>> = HashMap::new();
     for (index, face) in faces.iter().enumerate() {
@@ -549,29 +543,7 @@ fn upscale_box_faces(
                     if output_x >= output_width {
                         break;
                     }
-                    let face_px = *cropped.get_pixel(x, y);
-                    let base_px = *output.get_pixel(output_x, output_y);
-                    let src_px = *image.get_pixel(
-                        (face.rect.x + x / factor).min(source_width - 1),
-                        (face.rect.y + y / factor).min(source_height - 1),
-                    );
-                    // Sparse faces (axolotl gills): isolated-tile xBRZ can
-                    // punch holes plain whole-image xBRZ kept, or invent
-                    // opacity in atlas gaps. Never drop below the base alpha
-                    // when the source pixel was opaque; never invent opacity
-                    // past the base when the source pixel was transparent.
-                    let out = if src_px.0[3] > 0 {
-                        if face_px.0[3] < base_px.0[3] {
-                            base_px
-                        } else {
-                            face_px
-                        }
-                    } else if face_px.0[3] > base_px.0[3] {
-                        base_px
-                    } else {
-                        face_px
-                    };
-                    output.put_pixel(output_x, output_y, out);
+                    output.put_pixel(output_x, output_y, *cropped.get_pixel(x, y));
                 }
             }
         }
@@ -583,12 +555,6 @@ fn upscale_box_faces(
 /// Distinct cube/element groups among the faces (used for status messages).
 pub fn box_count(faces: &[ModelFace]) -> usize {
     faces.iter().map(|face| face.group).collect::<HashSet<_>>().len()
-}
-
-fn copy_rgba_buffer(output: &mut RgbaImage, rgba: &[u8]) {
-    let target = output.as_mut();
-    let len = target.len().min(rgba.len());
-    target[..len].copy_from_slice(&rgba[..len]);
 }
 
 #[cfg(test)]
@@ -859,6 +825,11 @@ mod tests {
         let mut second = face(0, 4, 2, 2);
         second.group = 1;
         assert_eq!(box_count(&[face(0, 0, 2, 2), second]), 2);
+
+        // Faces paste onto an empty canvas: a pixel outside every face rect
+        // must stay transparent (no plain-xBRZ base underneath).
+        // west is (0,2,2×2) → dest (0,8)-(8,16); (0,0) is outside all faces.
+        assert_eq!(stitched.get_pixel(0, 0).0[3], 0, "non-face pixel stays empty");
     }
 
     #[test]
@@ -956,46 +927,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn face_stitch_never_punches_holes_in_opaque_source() {
-        // Sparse opaque island: isolated-tile xBRZ may erode it; composite
-        // must keep the plain base opacity for source-opaque pixels.
-        let mut image = RgbaImage::new(8, 8);
-        for y in 0..8 {
-            for x in 0..8 {
-                image.put_pixel(x, y, Rgba([0, 0, 0, 0]));
-            }
-        }
-        // Thin opaque strand inside the face.
-        for x in 2..6 {
-            image.put_pixel(x, 4, Rgba([240, 100, 160, 255]));
-        }
-        let faces = [ModelFace {
-            texture: String::new(),
-            rect: FaceRect {
-                x: 2,
-                y: 2,
-                width: 4,
-                height: 4,
-            },
-            face: "north".into(),
-            group: 0,
-        }];
-        let out = upscale_image(
-            &image,
-            Some(&faces),
-            &UpscaleConfig {
-                factor: 4,
-                stitch_faces: true,
-            },
-        )
-        .expect("stitch");
-        // Every output pixel covering source (4,4) must stay opaque.
-        for dy in 0..4 {
-            for dx in 0..4 {
-                let a = out.get_pixel(4 * 4 + dx, 4 * 4 + dy).0[3];
-                assert!(a >= 200, "src(4,4) block ({dx},{dy}) alpha={a}");
-            }
-        }
-    }
 }
