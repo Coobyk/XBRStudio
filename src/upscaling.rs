@@ -196,14 +196,42 @@ fn neighbor_or_wrap(
             return sample_edge(source, &neighbor.rect, n_edge, rev, i, len, depth);
         }
     }
-    // No neighbor in this box: wrap the face's own opposite edge.
-    let opposite = match edge {
-        Edge::Top => Edge::Bottom,
-        Edge::Bottom => Edge::Top,
-        Edge::Left => Edge::Right,
-        Edge::Right => Edge::Left,
+    // No neighbor face: use the atlas pixels just outside this edge (the same
+    // context whole-image xBRZ sees). Self-wrapping the opposite edge invents
+    // seams on sparse flat-cube faces (axolotl gills/legs).
+    sample_atlas_outside(source, &face.rect, edge, i, len, depth)
+}
+
+/// Sample `depth` steps outward from `rect`'s `edge` (0 = the adjacent atlas
+/// pixel outside the face), parameterized along the edge like `sample_edge`.
+fn sample_atlas_outside(
+    source: &RgbaImage,
+    rect: &FaceRect,
+    edge: Edge,
+    i: i32,
+    len: usize,
+    depth: u32,
+) -> Rgba<u8> {
+    let len = len.max(1);
+    let i = i.clamp(0, len as i32 - 1) as usize;
+    let p = if len <= 1 {
+        0
+    } else {
+        i * (match edge {
+            Edge::Top | Edge::Bottom => rect.width,
+            Edge::Left | Edge::Right => rect.height,
+        }
+        .max(1) as usize
+            - 1)
+            / (len - 1)
     };
-    sample_edge(source, &face.rect, opposite, false, i, len, depth)
+    let (x, y) = match edge {
+        Edge::Top => (rect.x + p as u32, rect.y.saturating_sub(1 + depth)),
+        Edge::Bottom => (rect.x + p as u32, rect.bottom() + depth),
+        Edge::Left => (rect.x.saturating_sub(1 + depth), rect.y + p as u32),
+        Edge::Right => (rect.right() + depth, rect.y + p as u32),
+    };
+    sample_clamped(source, x as i64, y as i64)
 }
 
 #[derive(Clone, Copy)]
@@ -217,7 +245,7 @@ enum Corner {
 /// Corner pixel at along-edge index `i` (may sit outside the face; clamped)
 /// and `depth` steps into the neighbor from the shared edge. Prefers the
 /// neighbor across the horizontal edge (top/bottom), then the vertical-edge
-/// neighbor, then the face's own opposite corner (wrap).
+/// neighbor, then the atlas pixel diagonally outside the face.
 fn corner_pixel(
     source: &RgbaImage,
     face: &ModelFace,
@@ -256,28 +284,30 @@ fn corner_pixel(
             );
         }
     }
-    let d = depth;
+    // Neither adjacent face exists: sample diagonally outside the face so the
+    // corner matches the atlas context plain xBRZ would use.
     let (x, y) = match corner {
         Corner::TopLeft => (
-            face.rect.right().saturating_sub(1 + d),
-            face.rect.bottom().saturating_sub(1 + d),
+            face.rect.x.saturating_sub(1 + depth),
+            face.rect.y.saturating_sub(1 + depth),
         ),
         Corner::TopRight => (
-            face.rect.x.saturating_add(d),
-            face.rect.bottom().saturating_sub(1 + d),
+            face.rect.right() + depth,
+            face.rect.y.saturating_sub(1 + depth),
         ),
         Corner::BottomLeft => (
-            face.rect.right().saturating_sub(1 + d),
-            face.rect.y.saturating_add(d),
+            face.rect.x.saturating_sub(1 + depth),
+            face.rect.bottom() + depth,
         ),
-        Corner::BottomRight => (face.rect.x.saturating_add(d), face.rect.y.saturating_add(d)),
+        Corner::BottomRight => (face.rect.right() + depth, face.rect.bottom() + depth),
     };
     sample_clamped(source, x as i64, y as i64)
 }
 
     /// (w+2·border)×(h+2·border) tile: interior = face's own atlas pixels, the
     /// border ring = each 3D-adjacent face sampled from the shared edge inward
-    /// (`depth` walks into that neighbor), or self-wrap when the neighbor is absent.
+    /// (`depth` walks into that neighbor), or the atlas pixels just outside
+    /// this face when the neighbor is absent.
     ///
     /// Border pixels never drop below the alpha of the face edge they frame:
     /// a transparent atlas gap next to an opaque edge would otherwise bleed
@@ -421,9 +451,9 @@ fn corner_pixel(
         sample_edge(source, &face.rect, edge, false, i, len, 0)
     }
 
-/// Neighbor-bordered cutout of `faces[index]`: interior is the face's atlas
-/// rect, surrounded by a `border`-pixel ring taken from the 3D-adjacent faces
-/// in the same cube (self-wrap when a neighbor is missing).
+    /// Neighbor-bordered cutout of `faces[index]`: interior is the face's atlas
+    /// rect, surrounded by a `border`-pixel ring taken from the 3D-adjacent faces
+    /// in the same cube (atlas pixels outside the face when a neighbor is missing).
 pub fn face_border_tile(
     source: &RgbaImage,
     faces: &[ModelFace],
@@ -519,7 +549,29 @@ fn upscale_box_faces(
                     if output_x >= output_width {
                         break;
                     }
-                    output.put_pixel(output_x, output_y, *cropped.get_pixel(x, y));
+                    let face_px = *cropped.get_pixel(x, y);
+                    let base_px = *output.get_pixel(output_x, output_y);
+                    let src_px = *image.get_pixel(
+                        (face.rect.x + x / factor).min(source_width - 1),
+                        (face.rect.y + y / factor).min(source_height - 1),
+                    );
+                    // Sparse faces (axolotl gills): isolated-tile xBRZ can
+                    // punch holes plain whole-image xBRZ kept, or invent
+                    // opacity in atlas gaps. Never drop below the base alpha
+                    // when the source pixel was opaque; never invent opacity
+                    // past the base when the source pixel was transparent.
+                    let out = if src_px.0[3] > 0 {
+                        if face_px.0[3] < base_px.0[3] {
+                            base_px
+                        } else {
+                            face_px
+                        }
+                    } else if face_px.0[3] > base_px.0[3] {
+                        base_px
+                    } else {
+                        face_px
+                    };
+                    output.put_pixel(output_x, output_y, out);
                 }
             }
         }
@@ -688,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn lone_face_wraps_own_opposite_edges() {
+    fn lone_face_uses_atlas_outside_own_edges() {
         let (image, faces) = box_fixture();
         let north = faces
             .iter()
@@ -696,10 +748,27 @@ mod tests {
             .unwrap()
             .clone();
         let group: HashMap<&str, &ModelFace> = [("north", &north)].into_iter().collect();
-        // north.Top falls back to the face's own bottom row: src(2,3),(3,3).
+        // north.Top samples the atlas row above the face (y = rect.y - 1).
         let tile = build_padded_tile(&image, &north, &group, 1);
-        assert_eq!(*tile.get_pixel(1, 0), Rgba([2, 3, 0, 255]));
-        assert_eq!(*tile.get_pixel(2, 0), Rgba([3, 3, 0, 255]));
+        let above_y = north.rect.y.saturating_sub(1);
+        for i in 0..north.rect.width {
+            let expected = *image.get_pixel(north.rect.x + i, above_y);
+            assert_eq!(
+                *tile.get_pixel(i + 1, 0),
+                expected,
+                "top border i={i} should be atlas above face"
+            );
+        }
+        // north.Bottom samples the atlas row below the face.
+        let below_y = north.rect.bottom();
+        for i in 0..north.rect.width {
+            let expected = *image.get_pixel(north.rect.x + i, below_y.min(image.height() - 1));
+            assert_eq!(
+                *tile.get_pixel(i + 1, tile.height() - 1),
+                expected,
+                "bottom border i={i} should be atlas below face"
+            );
+        }
     }
 
     #[test]
@@ -840,6 +909,93 @@ mod tests {
         for y in 0..tile.height() {
             let a = tile.get_pixel(tile.width() - 1, y).0[3];
             assert_eq!(a, 255, "right border y={y} alpha={a}");
+        }
+    }
+
+    #[test]
+    fn missing_neighbor_border_uses_atlas_outside_not_opposite_edge() {
+        // Sparse face: opposite edge is transparent, atlas above is opaque
+        // pink (axolotl gill). Missing top neighbor must sample outside, not
+        // wrap the bottom edge.
+        let mut image = RgbaImage::new(6, 6);
+        for x in 0..6 {
+            image.put_pixel(x, 1, Rgba([220, 80, 140, 255])); // atlas row above face
+        }
+        // Face at (1,2) 4×2 — interior transparent except one opaque pixel.
+        image.put_pixel(2, 3, Rgba([220, 80, 140, 255]));
+        let north = ModelFace {
+            texture: String::new(),
+            rect: FaceRect {
+                x: 1,
+                y: 2,
+                width: 4,
+                height: 2,
+            },
+            face: "north".into(),
+            group: 0,
+        };
+        let group: HashMap<&str, &ModelFace> = [("north", &north)].into_iter().collect();
+        let tile = build_padded_tile(&image, &north, &group, 1);
+        // Top border (y=0) must be the atlas row above (opaque pink).
+        for x in 0..4 {
+            let px = tile.get_pixel(x + 1, 0);
+            assert_eq!(px.0[3], 255, "top border x={x} should use atlas outside");
+            assert_eq!(px.0[..3], [220, 80, 140], "top border color");
+        }
+        // Bottom border under transparent face-edge columns keeps atlas below
+        // (row 4 is transparent). Column under the opaque face pixel is
+        // floored opaque by floor_border_alpha (must not punch a hole).
+        for x in 0..4 {
+            let face_edge_opaque = x == 1; // face pixel (2,3) maps to border i=1
+            let a = tile.get_pixel(x + 1, tile.height() - 1).0[3];
+            if face_edge_opaque {
+                assert_eq!(a, 255, "bottom border under opaque edge stays opaque");
+            } else {
+                assert_eq!(a, 0, "bottom border x={x} uses transparent atlas below");
+            }
+        }
+    }
+
+    #[test]
+    fn face_stitch_never_punches_holes_in_opaque_source() {
+        // Sparse opaque island: isolated-tile xBRZ may erode it; composite
+        // must keep the plain base opacity for source-opaque pixels.
+        let mut image = RgbaImage::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                image.put_pixel(x, y, Rgba([0, 0, 0, 0]));
+            }
+        }
+        // Thin opaque strand inside the face.
+        for x in 2..6 {
+            image.put_pixel(x, 4, Rgba([240, 100, 160, 255]));
+        }
+        let faces = [ModelFace {
+            texture: String::new(),
+            rect: FaceRect {
+                x: 2,
+                y: 2,
+                width: 4,
+                height: 4,
+            },
+            face: "north".into(),
+            group: 0,
+        }];
+        let out = upscale_image(
+            &image,
+            Some(&faces),
+            &UpscaleConfig {
+                factor: 4,
+                stitch_faces: true,
+            },
+        )
+        .expect("stitch");
+        // Every output pixel covering source (4,4) must stay opaque.
+        for dy in 0..4 {
+            for dx in 0..4 {
+                let a = out.get_pixel(4 * 4 + dx, 4 * 4 + dy).0[3];
+                assert!(a >= 200, "src(4,4) block ({dx},{dy}) alpha={a}");
+            }
         }
     }
 }
