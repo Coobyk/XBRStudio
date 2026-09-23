@@ -30,6 +30,9 @@ pub struct ModelFace {
     pub texture: String,
     pub rect: FaceRect,
     pub face: String,
+    /// Cube/element index within the model; neighbors are only looked up
+    /// inside this group.
+    pub group: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -106,7 +109,7 @@ fn parse_block_model(root: &Value) -> Result<ModelFaces, String> {
         .map_err(|e| format!("unsupported block model structure: {e}"))?;
 
     let mut faces = Vec::new();
-    for element in model.elements {
+    for (element_index, element) in model.elements.into_iter().enumerate() {
         for (face_name, face) in element.faces {
             if let Some(uv) = face.uv {
                 let texture = face
@@ -124,6 +127,7 @@ fn parse_block_model(root: &Value) -> Result<ModelFaces, String> {
                         height: (uv[3] - uv[1]).round().max(0.0) as u32,
                     },
                     face: face_name,
+                    group: element_index as u32,
                 });
             }
         }
@@ -147,8 +151,9 @@ fn parse_entity_model(root: &Value) -> Result<ModelFaces, String> {
 
     let mut faces = Vec::new();
     let textures = HashMap::new();
+    let mut group_counter = 0u32;
     for part in &model.parts {
-        collect_entity_faces(part, &textures, &mut faces);
+        collect_entity_faces(part, &textures, &mut faces, &mut group_counter);
     }
 
     Ok(ModelFaces {
@@ -162,6 +167,7 @@ fn collect_entity_faces(
     part: &RawEntityPart,
     textures: &HashMap<String, String>,
     out: &mut Vec<ModelFace>,
+    group_counter: &mut u32,
 ) {
     for cube in &part.cubes {
         let [dx, dy, dz] = cube.size;
@@ -175,6 +181,9 @@ fn collect_entity_faces(
         let u3 = u + dz + dx + dz;
         let v0 = v;
         let v1 = v + dz;
+
+        let group = *group_counter;
+        *group_counter += 1;
 
         let rects = [
             ("down", u1, v0, dx, dz),
@@ -195,12 +204,13 @@ fn collect_entity_faces(
                     height: h.round().max(0.0) as u32,
                 },
                 face: face_name.into(),
+                group,
             });
         }
     }
 
     for child in &part.children {
-        collect_entity_faces(child, textures, out);
+        collect_entity_faces(child, textures, out, group_counter);
     }
 }
 
@@ -365,6 +375,7 @@ mod tests {
                         height: 16,
                     },
                     face: "north".into(),
+                    group: 0,
                 },
                 ModelFace {
                     texture: String::new(),
@@ -375,6 +386,7 @@ mod tests {
                         height: 16,
                     },
                     face: "east".into(),
+                    group: 1,
                 },
             ],
             uv_size: (16.0, 16.0),
@@ -398,11 +410,48 @@ mod tests {
                     height: 16,
                 },
                 face: "north".into(),
+                group: 0,
             }],
             uv_size: (64.0, 64.0),
         };
         let image = RgbaImage::new(32, 32);
         scale_model_faces_to_image(&mut model, &image);
         assert!(model.faces.is_empty());
+    }
+
+    #[test]
+    fn assigns_group_per_box() {
+        let entity = json!({
+            "texture_size": [64, 64],
+            "parts": [{
+                "name": "head",
+                "cubes": [
+                    {"origin": [0, 0, 0], "size": [8, 8, 6], "uv": [0, 0]},
+                    {"origin": [0, 0, 0], "size": [2, 3, 1], "uv": [22, 0]}
+                ]
+            }]
+        });
+        let parsed = parse_model(&entity).unwrap();
+        let groups: std::collections::HashSet<u32> =
+            parsed.faces.iter().map(|face| face.group).collect();
+        assert_eq!(groups, [0, 1].into_iter().collect());
+        assert!(parsed
+            .faces
+            .iter()
+            .filter(|face| face.group == 0)
+            .all(|face| matches!(face.face.as_str(), "down" | "up" | "east" | "north" | "west" | "south")));
+
+        let block = json!({
+            "elements": [
+                {"from": [0, 0, 0], "to": [16, 16, 16],
+                 "faces": {"north": {"uv": [0, 0, 16, 16]}}},
+                {"from": [0, 0, 0], "to": [8, 8, 8],
+                 "faces": {"east": {"uv": [0, 0, 8, 8]}}}
+            ]
+        });
+        let parsed = parse_model(&block).unwrap();
+        let groups: std::collections::HashSet<u32> =
+            parsed.faces.iter().map(|face| face.group).collect();
+        assert_eq!(groups, [0, 1].into_iter().collect());
     }
 }

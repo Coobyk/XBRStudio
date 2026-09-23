@@ -41,7 +41,7 @@ struct Cli {
     #[arg(long)]
     no_stitch: bool,
 
-    /// Skip the 1px self-tiling border wrap for block textures.
+    /// Skip the 1px self-tiling border wrap for block textures and the beacon beam.
     #[arg(long)]
     no_wrap: bool,
 }
@@ -89,8 +89,7 @@ fn run_single(cli: &Cli, input: &Path) -> Result<(), String> {
         stitch_faces: !cli.no_stitch && faces.is_some(),
     };
 
-    let wrap =
-        !cli.no_wrap && !config.stitch_faces && jar::is_block_texture_path(input);
+    let wrap = !cli.no_wrap && !config.stitch_faces && jar::is_wrap_texture_path(input);
     let output_image = if wrap {
         upscaling::upscale_wrapped(&source, cli.factor)?
     } else {
@@ -126,12 +125,14 @@ fn run_single(cli: &Cli, input: &Path) -> Result<(), String> {
         if wrap { ", tiled wrap" } else { "" }
     );
 
-    if let Some(faces) = faces {
-        println!(
-            "stitched {} model faces into {} groups",
-            faces.faces.len(),
-            upscaling::group_stitch_faces(&faces.faces, source.width(), source.height()).len()
-        );
+    if config.stitch_faces {
+        if let Some(faces) = faces {
+            println!(
+                "stitched {} model faces across {} boxes",
+                faces.faces.len(),
+                upscaling::box_count(&faces.faces)
+            );
+        }
     }
 
     Ok(())
@@ -176,7 +177,7 @@ fn run_batch(cli: &Cli, jar_path: &Path) -> Result<(), String> {
         cli.factor
     );
     if report.wrapped > 0 {
-        println!("  block textures with tiled wrap: {}", report.wrapped);
+        println!("  textures with tiled wrap: {}", report.wrapped);
     }
     if report.animated > 0 {
         println!("  frame-aware animated textures: {}", report.animated);
@@ -186,6 +187,18 @@ fn run_batch(cli: &Cli, jar_path: &Path) -> Result<(), String> {
             "  entity textures stitched with {} models: {}",
             report.entity_models, report.stitched
         );
+    }
+    if !report.unmatched_entity.is_empty() {
+        println!(
+            "  entity textures without a matching model: {}",
+            report.unmatched_entity.len()
+        );
+        for path in report.unmatched_entity.iter().take(20) {
+            println!("    {path}");
+        }
+        if report.unmatched_entity.len() > 20 {
+            println!("    … and {} more", report.unmatched_entity.len() - 20);
+        }
     }
     if !report.errors.is_empty() {
         eprintln!("{} textures failed:", report.errors.len());

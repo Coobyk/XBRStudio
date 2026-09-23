@@ -21,6 +21,9 @@ pub struct BatchReport {
     pub wrapped: usize,
     pub errors: Vec<(String, String)>,
     pub entity_models: usize,
+    /// Non-animated `entity/` textures that found no model (or lost too many
+    /// faces to the clip gate), sorted by path.
+    pub unmatched_entity: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,8 +51,8 @@ pub struct BatchOptions {
     pub stitch: bool,
     /// `None` auto-discovers `models/entity`; `Some(path)` uses that directory.
     pub model_dir: Option<PathBuf>,
-    /// Upscale `textures/block/**` with a 1px self-tiling border so edges get
-    /// wrap context (border scaled away afterwards).
+    /// Upscale `textures/block/**` and the beacon beam with a 1px self-tiling
+    /// border so edges get wrap context (border scaled away afterwards).
     pub wrap: bool,
 }
 
@@ -71,9 +74,32 @@ pub fn is_block_texture_path(path: &Path) -> bool {
         .any(|component| component.as_os_str().to_str() == Some("block"))
 }
 
+/// Relative (to `textures/`) paths that get a 1px self-tiling wrap border:
+/// `block/**` plus the beacon beam, which tiles around the beam column.
+pub fn wants_wrap(relative: &str) -> bool {
+    relative.starts_with("block/") || relative == "entity/beacon/beacon_beam.png"
+}
+
+/// Filesystem-path form of [`wants_wrap`] for single-texture mode.
+pub fn is_wrap_texture_path(path: &Path) -> bool {
+    if is_block_texture_path(path) {
+        return true;
+    }
+    path.file_name()
+        .is_some_and(|name| name == "beacon_beam.png")
+}
+
 struct EntityModel {
     faces: ModelFaces,
     has_texture_size: bool,
+    /// Normalized class stem, e.g. `adultwolf`.
+    key: String,
+    /// `key` with one leading adult/baby/cold/warm token removed.
+    base_key: String,
+    /// Normalized package directories (every FQCN component but the class).
+    pkg_dirs: Vec<String>,
+    /// Lowercased method name, e.g. `createbodylayer`.
+    method: String,
 }
 
 struct ProcessOutcome {
@@ -155,7 +181,7 @@ pub fn upscale_jar(
             .map(|dir| load_entity_models(&dir))
             .unwrap_or_default()
     } else {
-        HashMap::new()
+        Vec::new()
     };
     let pack_format = read_pack_format(&mut archive);
 
@@ -173,6 +199,7 @@ pub fn upscale_jar(
         wrapped: 0,
         errors: Vec::new(),
         entity_models: models.len(),
+        unmatched_entity: Vec::new(),
     };
 
     for (position, (index, name)) in textures.iter().enumerate() {
@@ -199,6 +226,8 @@ pub fn upscale_jar(
                 }
                 if outcome.stitched {
                     report.stitched += 1;
+                } else if opts.stitch && !outcome.animated && short.starts_with("entity/") {
+                    report.unmatched_entity.push(short.to_string());
                 }
                 if outcome.wrapped {
                     report.wrapped += 1;
@@ -212,6 +241,7 @@ pub fn upscale_jar(
         report.errors.push(("pack.mcmeta".into(), error));
     }
 
+    report.unmatched_entity.sort();
     Ok(report)
 }
 
@@ -233,7 +263,7 @@ fn process_one(
     index_by_name: &HashMap<String, usize>,
     out_dir: &Path,
     opts: &BatchOptions,
-    models: &HashMap<String, EntityModel>,
+    models: &[EntityModel],
 ) -> Result<ProcessOutcome, String> {
     let bytes = read_entry(archive, index)?;
     let image = image::load_from_memory(&bytes)
@@ -255,7 +285,7 @@ fn process_one(
         .is_some_and(|value| value.get("animation").is_some_and(|item| !item.is_null()));
 
     let relative = name.strip_prefix(TEXTURE_ROOT).unwrap_or(name);
-    let wrap = opts.wrap && relative.starts_with("block/");
+    let wrap = opts.wrap && wants_wrap(relative);
 
     let (output, out_mcmeta, animated, stitched) = if is_animated {
         let value = mcmeta_value.clone().expect("checked above");
@@ -269,10 +299,11 @@ fn process_one(
     } else {
         let mut local_model: Option<ModelFaces> = None;
         if opts.stitch {
-            if let Some(family) = entity_family_key(relative) {
-                if let Some(template) = models.get(&family) {
-                    let mut model_faces = template.faces.clone();
-                    if !template.has_texture_size {
+            if let Some(ctx) = texture_ctx(relative) {
+                if let Some(model) = best_model_for(models, &ctx) {
+                    let original_faces = model.faces.faces.len();
+                    let mut model_faces = model.faces.clone();
+                    if !model.has_texture_size {
                         model_faces.uv_size = (
                             image.width() as f32,
                             image.height() as f32,
@@ -280,7 +311,7 @@ fn process_one(
                     }
                     scale_model_faces_to_image(&mut model_faces, &image);
                     if !model_faces.faces.is_empty()
-                        && model_faces.faces.len() * 2 >= template.faces.faces.len()
+                        && model_faces.faces.len() * 2 >= original_faces
                     {
                         local_model = Some(model_faces);
                     }
@@ -435,26 +466,266 @@ fn entity_family_key(relative_path: &str) -> Option<String> {
     if key.is_empty() { None } else { Some(key) }
 }
 
-fn model_score(method: &str, has_texture_size: bool, face_count: usize) -> i64 {
-    let method = method.to_ascii_lowercase();
-    let mut score = face_count as i64;
-    if has_texture_size {
-        score += 2_000;
-    }
-    if method.contains("armor") {
-        score -= 10_000;
-    }
-    if method.contains("chest") || method.contains("pose") {
-        score -= 500;
-    }
-    score
+/// Scoring inputs derived from the texture's path inside `textures/`.
+#[derive(Debug, Clone)]
+struct TextureCtx {
+    family: String,
+    /// Second path segment (equipment armor slot), empty when absent.
+    subdir: String,
+    /// Normalized filename stem, e.g. `chickencoldbaby`.
+    stem: String,
+    /// `stem` with trailing baby/cold/warm/temperate/pup tokens removed.
+    stripped: String,
+    wants_baby: bool,
+    wants_cold: bool,
+    wants_warm: bool,
+    is_equipment: bool,
 }
 
-fn load_entity_models(model_dir: &Path) -> HashMap<String, EntityModel> {
+fn strip_key_prefix(key: &str) -> String {
+    for prefix in ["adult", "baby", "cold", "warm"] {
+        if key.starts_with(prefix) && key.len() > prefix.len() {
+            return key[prefix.len()..].to_string();
+        }
+    }
+    key.to_string()
+}
+
+fn strip_variant_tokens(stem: &str) -> (String, bool, bool, bool) {
+    let mut text = stem.to_string();
+    let mut wants_baby = false;
+    let mut wants_cold = false;
+    let mut wants_warm = false;
+    loop {
+        let Some(token) = ["baby", "pup", "cold", "warm", "temperate"]
+            .into_iter()
+            .find(|token| text.len() > token.len() && text.ends_with(token))
+        else {
+            break;
+        };
+        match token {
+            "baby" | "pup" => wants_baby = true,
+            "cold" => wants_cold = true,
+            "warm" => wants_warm = true,
+            _ => {}
+        }
+        text.truncate(text.len() - token.len());
+    }
+    (text, wants_baby, wants_cold, wants_warm)
+}
+
+fn texture_ctx(relative_path: &str) -> Option<TextureCtx> {
+    let family = entity_family_key(relative_path)?;
+    let rest = relative_path.strip_prefix("entity/")?;
+    // Slot subdir only exists for deeper paths like equipment/humanoid/x.png.
+    let subdir = if rest.split('/').count() >= 3 {
+        rest.split('/').nth(1).map(normalize_key).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let file = rest.rsplit('/').next().unwrap_or(rest);
+    let stem = normalize_key(file.strip_suffix(".png").unwrap_or(file));
+    if stem.is_empty() {
+        return None;
+    }
+    let is_equipment = family == "equipment";
+    let (stripped, wants_baby, wants_cold, wants_warm) = strip_variant_tokens(&stem);
+    Some(TextureCtx {
+        family,
+        subdir,
+        stem,
+        stripped,
+        wants_baby,
+        wants_cold,
+        wants_warm,
+        is_equipment,
+    })
+}
+
+fn alias_targets(family: &str) -> &'static [&'static str] {
+    match family {
+        "cat" => &["feline", "adultfeline", "babyfeline"],
+        "leadknot" => &["leashknot"],
+        "bear" => &["polarbear"],
+        "wither" => &["witherboss"],
+        "chestboat" => &["boat"],
+        "zombie" => &["humanoid"],
+        "horse" => &["abstractequine"],
+        _ => &[],
+    }
+}
+
+/// Maps an equipment subdir (already normalized, so `humanoid_baby` arrives as
+/// `humanoidbaby`) onto the model key of the layer that should be stitched.
+fn equipment_target(subdir: &str) -> Option<&'static str> {
+    match subdir {
+        "humanoid" | "humanoidbaby" | "humanoidleggings" => Some("humanoid"),
+        "wings" => Some("elytra"),
+        "llamabody" => Some("llama"),
+        "wolfbody" => Some("wolf"),
+        "happyghastbody" => Some("happyghastharness"),
+        "nautilusbody" => Some("nautilus"),
+        "horsebody" => Some("abstractequine"),
+        "camelsaddle" | "camelhusksaddle" => Some("camelsaddle"),
+        "nautilussaddle" => Some("nautilussaddle"),
+        "horsesaddle" | "mulesaddle" | "donkeysaddle"
+        | "skeletonhorsesaddle" | "zombiahorsesaddle" => Some("equinesaddle"),
+        _ => None,
+    }
+}
+
+/// Significant-match threshold: any real signal scores ≥ ~2000; a model with
+/// no signal at all must not win on face count alone.
+const MIN_SIGNAL: i64 = 1500;
+
+/// Armor-layer methods/models. `ends_with("armor")` so `armorstand` (the
+/// stand itself) is not mistaken for an armor layer, while `armorstandarmor`
+/// and `nautilusarmor` are.
+fn is_armor_method(method: &str, key: &str) -> bool {
+    method.contains("armor") || key.ends_with("armor")
+}
+
+fn signal_score(model: &EntityModel, ctx: &TextureCtx) -> i64 {
+    let key = model.key.as_str();
+    let base = model.base_key.as_str();
+    let method = model.method.as_str();
+
+    let model_baby = key.starts_with("baby") || method.contains("baby");
+    let model_adult = key.starts_with("adult") || method.contains("adult");
+    // Baby models may only use stem/base signals when the texture wants a baby.
+    let aligned = !(model_baby && !ctx.wants_baby);
+
+    let mut signal = 0i64;
+
+    if key == ctx.family {
+        signal += 3000;
+    } else if base == ctx.family && aligned {
+        // Prefix-keyed models (coldcow, babywolf) earn the family credit here
+        // instead of the stronger exact-key match.
+        signal += 2600;
+    }
+    if model.pkg_dirs.iter().any(|dir| dir == &ctx.family) {
+        signal += 2200;
+    }
+    if aligned {
+        if ctx.stripped == key {
+            signal += 3400;
+        } else if ctx.stripped == base {
+            signal += 3200;
+        } else if key.starts_with(ctx.stripped.as_str()) && key.len() > ctx.stripped.len() {
+            signal += 3000;
+        } else if ctx.stripped.starts_with(key) && ctx.stripped.len() > key.len() {
+            signal += 3000;
+        }
+    }
+    // Age mismatch: baby texture must not lean on a non-baby model (and vice
+    // versa) via alias/stem bonuses that ignore the baby/adult distinction.
+    let age_mismatch = (ctx.wants_baby && !model_baby) || (!ctx.wants_baby && model_baby);
+    if !age_mismatch && alias_targets(&ctx.family).contains(&key) {
+        signal += 2500;
+    }
+
+    if ctx.is_equipment {
+        if let Some(target) = equipment_target(&ctx.subdir)
+            && (key == target || key.starts_with(target))
+        {
+            signal += 2800;
+        }
+        if is_armor_method(method, key) {
+            signal += 2000;
+        }
+        if ctx.subdir == "humanoidbaby" && model_baby {
+            signal += 1000;
+        }
+    } else if is_armor_method(method, key) {
+        signal -= 10_000;
+    }
+
+    let method_chestboat = method.contains("chestboat");
+    if ctx.family == "chestboat" {
+        if method_chestboat {
+            signal += 1500;
+        }
+    } else if method_chestboat {
+        signal -= 1500;
+    }
+    if method.contains("pose") {
+        signal -= 500;
+    }
+
+    if ctx.family == "chest" {
+        if ctx.stem.contains("left") {
+            if method.contains("left") {
+                signal += 1200;
+            }
+        } else if ctx.stem.contains("right") {
+            if method.contains("right") {
+                signal += 1200;
+            }
+        } else if method.contains("single") {
+            signal += 1200;
+        }
+    }
+
+    if ctx.wants_baby && model_baby {
+        signal += 600;
+    } else if ctx.wants_baby && model_adult {
+        signal -= 400;
+    } else if !ctx.wants_baby && model_baby {
+        signal -= 600;
+    } else if !ctx.wants_baby && model_adult {
+        signal += 200;
+    }
+
+    let model_cold = key.starts_with("cold") || method.contains("cold");
+    let model_warm = key.starts_with("warm") || method.contains("warm");
+    if ctx.wants_cold {
+        if model_cold {
+            signal += 800;
+        } else {
+            signal -= 800;
+        }
+    } else if ctx.wants_warm {
+        if model_warm {
+            signal += 800;
+        } else {
+            signal -= 800;
+        }
+    } else if model_cold || model_warm {
+        signal -= 300;
+    }
+
+    if ctx.stripped.starts_with("tropicala") && key.contains("small") {
+        signal += 600;
+    }
+    if ctx.stripped.starts_with("tropicalb") && key.contains("large") {
+        signal += 600;
+    }
+
+    signal
+}
+
+fn score_model(model: &EntityModel, ctx: &TextureCtx) -> i64 {
+    if signal_score(model, ctx) < MIN_SIGNAL {
+        return i64::MIN / 4; // ineligible, but comparable for max()
+    }
+    signal_score(model, ctx) + model.faces.faces.len() as i64
+        + if model.has_texture_size { 300 } else { 0 }
+}
+
+fn best_model_for<'a>(models: &'a [EntityModel], ctx: &TextureCtx) -> Option<&'a EntityModel> {
+    models
+        .iter()
+        .filter(|model| signal_score(model, ctx) >= MIN_SIGNAL)
+        .max_by_key(|model| score_model(model, ctx))
+}
+
+fn load_entity_models(model_dir: &Path) -> Vec<EntityModel> {
     let mut json_files = Vec::new();
     collect_json_files(model_dir, &mut json_files);
+    json_files.sort();
 
-    let mut models: HashMap<String, (i64, EntityModel)> = HashMap::new();
+    let mut models = Vec::new();
     for path in json_files {
         let Ok(data) = std::fs::read_to_string(&path) else {
             continue;
@@ -484,30 +755,24 @@ fn load_entity_models(model_dir: &Path) -> HashMap<String, EntityModel> {
         let method = value
             .get("method")
             .and_then(Value::as_str)
-            .unwrap_or_default();
-        let score = model_score(method, has_texture_size, parsed.faces.len());
-
-        match models.get(&key) {
-            Some((best, _)) if *best >= score => {}
-            _ => {
-                models.insert(
-                    key,
-                    (
-                        score,
-                        EntityModel {
-                            faces: parsed,
-                            has_texture_size,
-                        },
-                    ),
-                );
-            }
-        }
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let pkg_dirs = fqcn
+            .split('.')
+            .take(fqcn.split('.').count().saturating_sub(1))
+            .map(normalize_key)
+            .collect::<Vec<_>>();
+        models.push(EntityModel {
+            faces: parsed,
+            has_texture_size,
+            base_key: strip_key_prefix(&key),
+            key,
+            pkg_dirs,
+            method,
+        });
     }
 
     models
-        .into_iter()
-        .map(|(key, (_, model))| (key, model))
-        .collect()
 }
 
 fn collect_json_files(directory: &Path, out: &mut Vec<PathBuf>) {
@@ -582,7 +847,7 @@ mod tests {
     fn build_test_jar() -> Vec<u8> {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-        let files: [(&str, Vec<u8>); 8] = [
+        let files: [(&str, Vec<u8>); 9] = [
             (
                 "assets/minecraft/textures/block/stone.png",
                 png_bytes(4, 4, [200, 50, 50, 255]),
@@ -602,6 +867,10 @@ mod tests {
             (
                 "assets/minecraft/textures/entity/cow/test_cow.png",
                 png_bytes(16, 16, [120, 80, 40, 255]),
+            ),
+            (
+                "assets/minecraft/textures/entity/wolf/wolf.png",
+                png_bytes(32, 16, [160, 160, 160, 255]),
             ),
             (
                 "assets/minecraft/textures/entity/equipment/test_armor.png",
@@ -640,6 +909,461 @@ mod tests {
             "zombievillager"
         );
         assert_eq!(model_key("net.minecraft.client.model.PlayerModel"), "player");
+        assert_eq!(strip_key_prefix("adultwolf"), "wolf");
+        assert_eq!(strip_key_prefix("coldcow"), "cow");
+        assert_eq!(strip_key_prefix("cow"), "cow");
+        assert_eq!(strip_key_prefix("babyzombievillager"), "zombievillager");
+        assert!(texture_ctx("entity/wolf/wolf_baby.png").unwrap().wants_baby);
+        assert!(
+            texture_ctx("entity/cow/cow_cold.png").unwrap().wants_cold
+        );
+        assert_eq!(
+            texture_ctx("entity/equipment/humanoid/iron.png")
+                .unwrap()
+                .subdir,
+            "humanoid"
+        );
+        assert_eq!(
+            texture_ctx("entity/equipment/test_armor.png")
+                .unwrap()
+                .subdir,
+            ""
+        );
+    }
+
+    fn test_model(key: &str, method: &str, pkg: &[&str], face_count: usize) -> EntityModel {
+        use crate::model::{FaceRect, ModelFace};
+        let faces = (0..face_count as u32)
+            .map(|index| ModelFace {
+                texture: "#0".into(),
+                rect: FaceRect {
+                    x: index * 2,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+                face: "top".into(),
+                group: 0,
+            })
+            .collect();
+        EntityModel {
+            faces: crate::model::ModelFaces {
+                textures: HashMap::new(),
+                faces,
+                uv_size: (64.0, 64.0),
+            },
+            has_texture_size: true,
+            base_key: strip_key_prefix(key),
+            key: key.into(),
+            pkg_dirs: pkg.iter().map(|dir| normalize_key(dir)).collect(),
+            method: method.into(),
+        }
+    }
+
+    fn pick<'a>(models: &'a [EntityModel], path: &str) -> Option<&'a EntityModel> {
+        let ctx = texture_ctx(path)?;
+        best_model_for(models, &ctx)
+    }
+
+    fn wolf_models() -> Vec<EntityModel> {
+        vec![
+            test_model(
+                "adultwolf",
+                "createbodylayer",
+                &["net", "minecraft", "client", "model", "animal", "wolf"],
+                60,
+            ),
+            test_model(
+                "babywolf",
+                "createbodylayer",
+                &["net", "minecraft", "client", "model", "animal", "wolf"],
+                54,
+            ),
+            test_model(
+                "cow",
+                "createbodylayer",
+                &["net", "minecraft", "client", "model", "animal", "cow"],
+                50,
+            ),
+        ]
+    }
+
+    #[test]
+    fn wolf_textures_prefer_matching_variant() {
+        let models = wolf_models();
+        assert_eq!(
+            pick(&models, "entity/wolf/wolf.png").map(|m| m.key.as_str()),
+            Some("adultwolf")
+        );
+        assert_eq!(
+            pick(&models, "entity/wolf/wolf_baby.png").map(|m| m.key.as_str()),
+            Some("babywolf")
+        );
+        assert_eq!(
+            pick(&models, "entity/wolf/wolf_angry.png").map(|m| m.key.as_str()),
+            Some("adultwolf")
+        );
+    }
+
+    #[test]
+    fn polarbear_baby_prefers_baby_model_over_adult_alias() {
+        let models = vec![
+            test_model(
+                "polarbear",
+                "createbodylayer",
+                &["net", "m", "model", "animal", "polarbear"],
+                60,
+            ),
+            test_model(
+                "babypolarbear",
+                "createbodylayer",
+                &["net", "m", "model", "animal", "polarbear"],
+                54,
+            ),
+            test_model(
+                "wolf",
+                "createbodylayer",
+                &["net", "m", "model", "animal", "wolf"],
+                50,
+            ),
+        ];
+        assert_eq!(
+            pick(&models, "entity/bear/polarbear.png").map(|m| m.key.as_str()),
+            Some("polarbear")
+        );
+        assert_eq!(
+            pick(&models, "entity/bear/polarbear_baby.png").map(|m| m.key.as_str()),
+            Some("babypolarbear")
+        );
+    }
+
+    #[test]
+    fn family_stem_alias_and_variant_matching() {
+        let fish = vec![
+            test_model(
+                "cod",
+                "createbodylayer",
+                &["net", "m", "model", "animal", "fish"],
+                30,
+            ),
+            test_model(
+                "salmon",
+                "createbodylayer",
+                &["net", "m", "model", "animal", "fish"],
+                30,
+            ),
+        ];
+        assert_eq!(
+            pick(&fish, "entity/fish/cod.png").map(|m| m.key.as_str()),
+            Some("cod")
+        );
+
+        let zombies = vec![
+            test_model("humanoid", "createmesh", &["net", "m", "model"], 42),
+            test_model(
+                "drowned",
+                "createbodylayer",
+                &["net", "m", "model", "monster", "zombie"],
+                48,
+            ),
+            test_model(
+                "babyzombie",
+                "createbodylayer",
+                &["net", "m", "model", "monster", "zombie"],
+                40,
+            ),
+        ];
+        assert_eq!(
+            pick(&zombies, "entity/zombie/zombie.png").map(|m| m.key.as_str()),
+            Some("humanoid")
+        );
+        assert_eq!(
+            pick(&zombies, "entity/zombie/husk.png").map(|m| m.key.as_str()),
+            Some("humanoid")
+        );
+        assert_eq!(
+            pick(&zombies, "entity/zombie/drowned.png").map(|m| m.key.as_str()),
+            Some("drowned")
+        );
+        assert_eq!(
+            pick(&zombies, "entity/zombie/drowned_baby.png").map(|m| m.key.as_str()),
+            Some("drowned")
+        );
+        assert_eq!(
+            pick(&zombies, "entity/zombie/zombie_baby.png").map(|m| m.key.as_str()),
+            Some("babyzombie")
+        );
+
+        let wither = vec![
+            test_model(
+                "witherboss",
+                "createbodylayer",
+                &["net", "m", "model", "monster", "wither"],
+                80,
+            ),
+            test_model(
+                "creeper",
+                "createbodylayer",
+                &["net", "m", "model", "monster", "creeper"],
+                40,
+            ),
+        ];
+        assert_eq!(
+            pick(&wither, "entity/wither/wither.png").map(|m| m.key.as_str()),
+            Some("witherboss")
+        );
+        let lead = vec![
+            test_model(
+                "leashknot",
+                "createbodylayer",
+                &["net", "m", "model", "object", "leash"],
+                6,
+            ),
+            test_model(
+                "bell",
+                "createbodylayer",
+                &["net", "m", "model", "object", "bell"],
+                8,
+            ),
+        ];
+        assert_eq!(
+            pick(&lead, "entity/lead_knot/lead_knot.png").map(|m| m.key.as_str()),
+            Some("leashknot")
+        );
+
+        let equines = vec![
+            test_model(
+                "abstractequine",
+                "createbodymesh",
+                &["net", "m", "model", "animal", "equine"],
+                72,
+            ),
+            test_model(
+                "donkey",
+                "createbodylayer",
+                &["net", "m", "model", "animal", "equine"],
+                72,
+            ),
+            test_model(
+                "babyhorse",
+                "createbabymesh",
+                &["net", "m", "model", "animal", "equine"],
+                60,
+            ),
+            test_model(
+                "babydonkey",
+                "createbabymesh",
+                &["net", "m", "model", "animal", "equine"],
+                60,
+            ),
+        ];
+        assert_eq!(
+            pick(&equines, "entity/horse/horse_black.png").map(|m| m.key.as_str()),
+            Some("abstractequine")
+        );
+        assert_eq!(
+            pick(&equines, "entity/horse/donkey.png").map(|m| m.key.as_str()),
+            Some("donkey")
+        );
+        assert_eq!(
+            pick(&equines, "entity/horse/donkey_baby.png").map(|m| m.key.as_str()),
+            Some("babydonkey")
+        );
+
+        let cats = vec![
+            test_model(
+                "adultfeline",
+                "createbodymesh",
+                &["net", "m", "model", "animal", "feline"],
+                48,
+            ),
+            test_model(
+                "babyfeline",
+                "createbabylayer",
+                &["net", "m", "model", "animal", "feline"],
+                40,
+            ),
+            test_model(
+                "cow",
+                "createbodylayer",
+                &["net", "m", "model", "animal", "cow"],
+                50,
+            ),
+        ];
+        assert_eq!(
+            pick(&cats, "entity/cat/cat_tabby.png").map(|m| m.key.as_str()),
+            Some("adultfeline")
+        );
+        assert_eq!(
+            pick(&cats, "entity/cat/cat_tabby_baby.png").map(|m| m.key.as_str()),
+            Some("babyfeline")
+        );
+
+        let chests = vec![
+            test_model(
+                "chest",
+                "createsinglebodylayer",
+                &["net", "m", "model", "object", "chest"],
+                40,
+            ),
+            test_model(
+                "chest",
+                "createdoublebodyleftlayer",
+                &["net", "m", "model", "object", "chest"],
+                50,
+            ),
+            test_model(
+                "chest",
+                "createdoublebodyrightlayer",
+                &["net", "m", "model", "object", "chest"],
+                50,
+            ),
+        ];
+        assert_eq!(
+            pick(&chests, "entity/chest/normal.png").map(|m| m.method.as_str()),
+            Some("createsinglebodylayer")
+        );
+        assert_eq!(
+            pick(&chests, "entity/chest/normal_left.png").map(|m| m.method.as_str()),
+            Some("createdoublebodyleftlayer")
+        );
+        assert_eq!(
+            pick(&chests, "entity/chest/normal_right.png").map(|m| m.method.as_str()),
+            Some("createdoublebodyrightlayer")
+        );
+
+        let boats = vec![
+            test_model(
+                "boat",
+                "createboatmodel",
+                &["net", "m", "model", "object", "boat"],
+                60,
+            ),
+            test_model(
+                "boat",
+                "createchestboatmodel",
+                &["net", "m", "model", "object", "boat"],
+                72,
+            ),
+            test_model(
+                "boat",
+                "addcommonparts",
+                &["net", "m", "model", "object", "boat"],
+                48,
+            ),
+        ];
+        assert_eq!(
+            pick(&boats, "entity/boat/oak.png").map(|m| m.method.as_str()),
+            Some("createboatmodel")
+        );
+        assert_eq!(
+            pick(&boats, "entity/chest_boat/oak.png").map(|m| m.method.as_str()),
+            Some("createchestboatmodel")
+        );
+
+        let cows = vec![
+            test_model(
+                "cow",
+                "createbodylayer",
+                &["net", "m", "model", "animal", "cow"],
+                60,
+            ),
+            test_model(
+                "coldcow",
+                "createbodylayer",
+                &["net", "m", "model", "animal", "cow"],
+                60,
+            ),
+        ];
+        assert_eq!(
+            pick(&cows, "entity/cow/cow_cold.png").map(|m| m.key.as_str()),
+            Some("coldcow")
+        );
+        assert_eq!(
+            pick(&cows, "entity/cow/cow_temperate.png").map(|m| m.key.as_str()),
+            Some("cow")
+        );
+    }
+
+    #[test]
+    fn equipment_slots_pick_the_right_layer_model() {
+        let models = vec![
+            test_model("humanoid", "createmesh", &["net", "m", "model"], 42),
+            test_model(
+                "humanoid",
+                "createbasearmormesh",
+                &["net", "m", "model"],
+                42,
+            ),
+            test_model(
+                "humanoid",
+                "createbabyarmormesh",
+                &["net", "m", "model"],
+                40,
+            ),
+            test_model(
+                "elytra",
+                "createlayer",
+                &["net", "m", "model", "object", "equipment"],
+                24,
+            ),
+        ];
+        let iron = pick(&models, "entity/equipment/humanoid/iron.png").unwrap();
+        assert_eq!(iron.key, "humanoid");
+        assert_eq!(iron.method, "createbasearmormesh");
+
+        let baby = pick(&models, "entity/equipment/humanoid_baby/iron.png").unwrap();
+        assert_eq!(baby.method, "createbabyarmormesh");
+
+        let wings = pick(&models, "entity/equipment/wings/elytra.png").unwrap();
+        assert_eq!(wings.key, "elytra");
+
+        // Saddle subdir with no model at all must not match anything.
+        let saddles = vec![test_model(
+            "cow",
+            "createbodylayer",
+            &["net", "m", "model", "animal", "cow"],
+            60,
+        )];
+        assert!(pick(&saddles, "entity/equipment/pig_saddle/saddle.png").is_none());
+    }
+
+    #[test]
+    fn armor_methods_lose_outside_equipment_and_pose_variants_lose() {
+        let models = vec![
+            test_model(
+                "armorstand",
+                "createbodylayer",
+                &["net", "m", "model", "object", "armorstand"],
+                60,
+            ),
+            test_model(
+                "armorstandarmor",
+                "createbodylayer",
+                &["net", "m", "model", "object", "armorstand"],
+                40,
+            ),
+            test_model(
+                "sniffer",
+                "createbodylayer",
+                &["net", "m", "model", "animal", "sniffer"],
+                70,
+            ),
+            test_model(
+                "sniffer",
+                "createsittingposebodylayer",
+                &["net", "m", "model", "animal", "sniffer"],
+                80,
+            ),
+        ];
+        assert_eq!(
+            pick(&models, "entity/armorstand/armorstand.png").map(|m| m.key.as_str()),
+            Some("armorstand")
+        );
+        assert_eq!(
+            pick(&models, "entity/sniffer/sniffer.png").map(|m| m.method.as_str()),
+            Some("createbodylayer")
+        );
     }
 
     #[test]
@@ -653,23 +1377,6 @@ mod tests {
             animation_frame_size(16, 320, &json!({"width": 4, "height": 2})),
             (4, 2)
         );
-    }
-
-    #[test]
-    fn base_meshes_outrank_armor_and_pose_variants() {
-        assert!(
-            model_score("createBodyLayer", true, 48)
-                > model_score("createBaseArmorMesh", true, 24)
-        );
-        assert!(
-            model_score("addCommonParts", true, 54)
-                > model_score("createChestBoatModel", true, 72)
-        );
-        assert!(
-            model_score("createBodyLayer", true, 54)
-                > model_score("createSittingPoseBodyLayer", true, 66)
-        );
-        assert!(model_score("createMesh", false, 42) > 0);
     }
 
     #[test]
@@ -715,6 +1422,36 @@ mod tests {
         )
         .unwrap();
 
+        let wolf_model = json!({
+            "model": "net.minecraft.client.model.animal.wolf.AdultWolfModel",
+            "method": "createBodyLayer",
+            "texture_size": [64, 32],
+            "parts": [{
+                "name": "body",
+                "translation": [0, 0, 0],
+                "rotation": [0, 0, 0],
+                "cubes": [{
+                    "origin": [0, 0, 0],
+                    "size": [6, 6, 10],
+                    "uv": [0, 0]
+                }]
+            }, {
+                "name": "head",
+                "translation": [0, 0, 0],
+                "rotation": [0, 0, 0],
+                "cubes": [{
+                    "origin": [0, 0, 0],
+                    "size": [6, 6, 6],
+                    "uv": [0, 20]
+                }]
+            }]
+        });
+        std::fs::write(
+            model_dir.join("AdultWolfModel.createBodyLayer.json"),
+            wolf_model.to_string(),
+        )
+        .unwrap();
+
         let jar_path = root.join("test.jar");
         std::fs::write(&jar_path, build_test_jar()).unwrap();
         let out_dir = root.join("out");
@@ -726,13 +1463,18 @@ mod tests {
         };
 
         let report = upscale_jar(&jar_path, &out_dir, &opts, |_| {}).unwrap();
-        assert_eq!(report.total, 4);
-        assert_eq!(report.upscaled, 4, "errors: {:?}", report.errors);
+        assert_eq!(report.total, 5);
+        assert_eq!(report.upscaled, 5, "errors: {:?}", report.errors);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.animated, 1);
-        assert_eq!(report.stitched, 1);
+        assert_eq!(report.stitched, 2, "cow + wolf should stitch");
         assert_eq!(report.wrapped, 2, "stone + lava (block/) should wrap");
-        assert_eq!(report.entity_models, 1);
+        assert_eq!(report.entity_models, 2);
+        assert_eq!(
+            report.unmatched_entity,
+            vec!["entity/equipment/test_armor.png".to_string()],
+            "only the model-less armor texture is unmatched"
+        );
 
         let stone = image::open(out_dir.join("assets/minecraft/textures/block/stone.png")).unwrap();
         assert_eq!((stone.width(), stone.height()), (4 * 2, 4 * 2));

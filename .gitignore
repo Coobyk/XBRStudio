@@ -35,3 +35,6 @@ minecraft-*.jar
 
 # Vanilla entity models extracted from Minecraft decompilation
 models/
+
+# Generated per-face debug slices
+slices/

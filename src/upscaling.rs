@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use image::{Rgba, RgbaImage};
 use xbrz::scale_rgba;
@@ -86,28 +86,392 @@ pub fn upscale_image(
         return Err("stitching requires at least one model face".to_string());
     }
 
-    let mut output = RgbaImage::from_pixel(output_width, output_height, Rgba([0, 0, 0, 0]));
+    upscale_box_faces(image, faces, config.factor)
+}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Edge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// Cube-edge adjacency, derived from `ModelPart.Cube` polygon vertex/UV
+/// assignment. Each face edge (top/bottom run left→right, left/right run
+/// top→bottom) maps to the neighbor face across the shared 3D edge, the
+/// neighbor's corresponding edge, and whether that edge traverses the shared
+/// line in the opposite direction.
+fn neighbor_edge(face: &str, edge: Edge) -> Option<(&'static str, Edge, bool)> {
+    use Edge::*;
+    Some(match (face, edge) {
+        ("down", Top) => ("south", Top, true),
+        ("down", Bottom) => ("north", Top, false),
+        ("down", Left) => ("west", Top, false),
+        ("down", Right) => ("east", Top, true),
+        ("up", Top) => ("south", Bottom, true),
+        ("up", Bottom) => ("north", Bottom, false),
+        ("up", Left) => ("west", Bottom, false),
+        ("up", Right) => ("east", Bottom, true),
+        ("west", Top) => ("down", Left, false),
+        ("west", Bottom) => ("up", Left, false),
+        ("west", Left) => ("south", Right, false),
+        ("west", Right) => ("north", Left, false),
+        ("north", Top) => ("down", Bottom, false),
+        ("north", Bottom) => ("up", Bottom, false),
+        ("north", Left) => ("west", Right, false),
+        ("north", Right) => ("east", Left, false),
+        ("east", Top) => ("down", Right, true),
+        ("east", Bottom) => ("up", Right, true),
+        ("east", Left) => ("north", Right, false),
+        ("east", Right) => ("south", Left, false),
+        ("south", Top) => ("down", Top, true),
+        ("south", Bottom) => ("up", Top, true),
+        ("south", Left) => ("east", Right, false),
+        ("south", Right) => ("west", Left, false),
+        _ => return None,
+    })
+}
+
+fn sample_clamped(image: &RgbaImage, x: i64, y: i64) -> Rgba<u8> {
+    let x = x.clamp(0, image.width() as i64 - 1) as u32;
+    let y = y.clamp(0, image.height() as i64 - 1) as u32;
+    *image.get_pixel(x, y)
+}
+
+/// Sample `rect`'s `edge` at parameter `i` of an edge that is `len` long on
+/// the asking face (param 0 = left/top end). `rev` flips the direction first;
+/// the parameter is then mapped proportionally onto the neighbor's own edge.
+/// `depth` walks that far into the rect from the shared edge (0 = the edge
+/// itself), clamped so sampling never leaves the rect.
+fn sample_edge(
+    image: &RgbaImage,
+    rect: &FaceRect,
+    edge: Edge,
+    rev: bool,
+    i: i32,
+    len: usize,
+    depth: u32,
+) -> Rgba<u8> {
+    let len = len.max(1);
+    let i = i.clamp(0, len as i32 - 1) as usize;
+    let j = if rev { len - 1 - i } else { i };
+    let n_len = match edge {
+        Edge::Top | Edge::Bottom => rect.width.max(1) as usize,
+        Edge::Left | Edge::Right => rect.height.max(1) as usize,
+    };
+    let p = if len <= 1 {
+        0
+    } else {
+        j * (n_len - 1) / (len - 1)
+    };
+    let d_x = depth.min(rect.width.saturating_sub(1));
+    let d_y = depth.min(rect.height.saturating_sub(1));
+    let (x, y) = match edge {
+        Edge::Top => (rect.x + p as u32, rect.y + d_y),
+        Edge::Bottom => (
+            rect.x + p as u32,
+            rect.bottom().saturating_sub(1 + d_y),
+        ),
+        Edge::Left => (rect.x + d_x, rect.y + p as u32),
+        Edge::Right => (
+            rect.right().saturating_sub(1 + d_x),
+            rect.y + p as u32,
+        ),
+    };
+    sample_clamped(image, x as i64, y as i64)
+}
+
+fn neighbor_or_wrap(
+    source: &RgbaImage,
+    face: &ModelFace,
+    group: &HashMap<&str, &ModelFace>,
+    edge: Edge,
+    i: i32,
+    len: usize,
+    depth: u32,
+) -> Rgba<u8> {
+    if let Some((name, n_edge, rev)) = neighbor_edge(&face.face, edge) {
+        if let Some(neighbor) = group.get(name) {
+            return sample_edge(source, &neighbor.rect, n_edge, rev, i, len, depth);
+        }
+    }
+    // No neighbor in this box: wrap the face's own opposite edge.
+    let opposite = match edge {
+        Edge::Top => Edge::Bottom,
+        Edge::Bottom => Edge::Top,
+        Edge::Left => Edge::Right,
+        Edge::Right => Edge::Left,
+    };
+    sample_edge(source, &face.rect, opposite, false, i, len, depth)
+}
+
+#[derive(Clone, Copy)]
+enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+/// Corner pixel at along-edge index `i` (may sit outside the face; clamped)
+/// and `depth` steps into the neighbor from the shared edge. Prefers the
+/// neighbor across the horizontal edge (top/bottom), then the vertical-edge
+/// neighbor, then the face's own opposite corner (wrap).
+fn corner_pixel(
+    source: &RgbaImage,
+    face: &ModelFace,
+    group: &HashMap<&str, &ModelFace>,
+    corner: Corner,
+    i: i32,
+    depth: u32,
+) -> Rgba<u8> {
+    let w = face.rect.width as usize;
+    let h = face.rect.height as usize;
+    let primary_edge = match corner {
+        Corner::TopLeft | Corner::TopRight => Edge::Top,
+        Corner::BottomLeft | Corner::BottomRight => Edge::Bottom,
+    };
+    if let Some((name, n_edge, rev)) = neighbor_edge(&face.face, primary_edge) {
+        if let Some(neighbor) = group.get(name) {
+            return sample_edge(source, &neighbor.rect, n_edge, rev, i, w.max(1), depth);
+        }
+    }
+    let (secondary_edge, secondary_i) = match corner {
+        Corner::TopLeft => (Edge::Left, 0),
+        Corner::TopRight => (Edge::Right, 0),
+        Corner::BottomLeft => (Edge::Left, h.saturating_sub(1) as i32),
+        Corner::BottomRight => (Edge::Right, h.saturating_sub(1) as i32),
+    };
+    if let Some((name, n_edge, rev)) = neighbor_edge(&face.face, secondary_edge) {
+        if let Some(neighbor) = group.get(name) {
+            return sample_edge(
+                source,
+                &neighbor.rect,
+                n_edge,
+                rev,
+                secondary_i,
+                h.max(1),
+                depth,
+            );
+        }
+    }
+    let d = depth;
+    let (x, y) = match corner {
+        Corner::TopLeft => (
+            face.rect.right().saturating_sub(1 + d),
+            face.rect.bottom().saturating_sub(1 + d),
+        ),
+        Corner::TopRight => (
+            face.rect.x.saturating_add(d),
+            face.rect.bottom().saturating_sub(1 + d),
+        ),
+        Corner::BottomLeft => (
+            face.rect.right().saturating_sub(1 + d),
+            face.rect.y.saturating_add(d),
+        ),
+        Corner::BottomRight => (face.rect.x.saturating_add(d), face.rect.y.saturating_add(d)),
+    };
+    sample_clamped(source, x as i64, y as i64)
+}
+
+/// (w+2·border)×(h+2·border) tile: interior = face's own atlas pixels, the
+/// border ring = each 3D-adjacent face sampled from the shared edge inward
+/// (`depth` walks into that neighbor), or self-wrap when the neighbor is absent.
+fn build_padded_tile(
+    source: &RgbaImage,
+    face: &ModelFace,
+    group: &HashMap<&str, &ModelFace>,
+    border: u32,
+) -> RgbaImage {
+    let (w, h) = (face.rect.width, face.rect.height);
+    let b = border.max(1);
+    let mut tile = RgbaImage::new(w + 2 * b, h + 2 * b);
+
+    for y in 0..h {
+        for x in 0..w {
+            let pixel = sample_clamped(
+                source,
+                (face.rect.x + x) as i64,
+                (face.rect.y + y) as i64,
+            );
+            tile.put_pixel(x + b, y + b, pixel);
+        }
+    }
+
+    let (w_i, h_i, b_i) = (w as i32, h as i32, b as i32);
+
+    for i in 0..w_i {
+        for depth in 0..b {
+            let top_y = b - 1 - depth;
+            let pixel = neighbor_or_wrap(source, face, group, Edge::Top, i, w as usize, depth);
+            tile.put_pixel((b_i + i) as u32, top_y, pixel);
+
+            let bottom_y = b + h + depth;
+            let pixel = neighbor_or_wrap(source, face, group, Edge::Bottom, i, w as usize, depth);
+            tile.put_pixel((b_i + i) as u32, bottom_y, pixel);
+        }
+    }
+
+    for i in 0..h_i {
+        for depth in 0..b {
+            let left_x = b - 1 - depth;
+            let pixel = neighbor_or_wrap(source, face, group, Edge::Left, i, h as usize, depth);
+            tile.put_pixel(left_x, (b_i + i) as u32, pixel);
+
+            let right_x = b + w + depth;
+            let pixel = neighbor_or_wrap(source, face, group, Edge::Right, i, h as usize, depth);
+            tile.put_pixel(right_x, (b_i + i) as u32, pixel);
+        }
+    }
+
+    for cy in 0..b {
+        for cx in 0..b {
+            let depth_y = b - 1 - cy;
+            let cx_i = cx as i32;
+
+            // Top-left: primary along-index extends left of the face (≤ 0).
+            let i = cx_i - b_i;
+            tile.put_pixel(cx, cy, corner_pixel(source, face, group, Corner::TopLeft, i, depth_y));
+
+            // Top-right: along-index extends right of the face (≥ w).
+            let i = w_i + cx_i;
+            tile.put_pixel(
+                b + w + cx,
+                cy,
+                corner_pixel(source, face, group, Corner::TopRight, i, depth_y),
+            );
+
+            // Bottom corners: depth grows downward from the interior.
+            let depth = cy;
+            let i = cx_i - b_i;
+            tile.put_pixel(
+                cx,
+                b + h + cy,
+                corner_pixel(source, face, group, Corner::BottomLeft, i, depth),
+            );
+            let i = w_i + cx_i;
+            tile.put_pixel(
+                b + w + cx,
+                b + h + cy,
+                corner_pixel(source, face, group, Corner::BottomRight, i, depth),
+            );
+        }
+    }
+
+    tile
+}
+
+/// Neighbor-bordered cutout of `faces[index]`: interior is the face's atlas
+/// rect, surrounded by a `border`-pixel ring taken from the 3D-adjacent faces
+/// in the same cube (self-wrap when a neighbor is missing).
+pub fn face_border_tile(
+    source: &RgbaImage,
+    faces: &[ModelFace],
+    index: usize,
+    border: u32,
+) -> Result<RgbaImage, String> {
+    let face = faces
+        .get(index)
+        .ok_or_else(|| format!("face index {index} out of range"))?;
+    if face.rect.width == 0 || face.rect.height == 0 {
+        return Err("cannot border a zero-size face".into());
+    }
+    if border == 0 {
+        return Err("border must be at least 1".into());
+    }
+    let group: HashMap<&str, &ModelFace> = faces
+        .iter()
+        .filter(|other| other.group == face.group)
+        .map(|other| (other.face.as_str(), other))
+        .collect();
+    Ok(build_padded_tile(source, face, &group, border))
+}
+
+/// Plain whole-image xBRZ base, then each face is replaced by its own
+/// neighbor-bordered tile (upscaled, border cropped) at `rect × factor`.
+fn upscale_box_faces(
+    image: &RgbaImage,
+    faces: &[ModelFace],
+    factor: u32,
+) -> Result<RgbaImage, String> {
+    let (source_width, source_height) = (image.width(), image.height());
+    let (output_width, output_height) = (
+        source_width * factor,
+        source_height * factor,
+    );
+
+    let mut output = RgbaImage::from_pixel(output_width, output_height, Rgba([0, 0, 0, 0]));
     let base = scale_rgba(
         image.as_raw(),
         source_width as usize,
         source_height as usize,
-        config.factor as usize,
+        factor as usize,
     );
     copy_rgba_buffer(&mut output, &base);
 
-    let groups = group_stitch_faces(faces, source_width, source_height);
-    for group in groups {
-        let group_faces: Vec<&ModelFace> = group.iter().map(|&index| &faces[index]).collect();
-        let bounds = match bounds_of_faces(&group_faces) {
-            Some(bounds) => bounds,
-            None => continue,
-        };
+    let mut boxes: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (index, face) in faces.iter().enumerate() {
+        boxes.entry(face.group).or_default().push(index);
+    }
 
-        upscale_group_into(image, &mut output, &group_faces, &bounds, config.factor)?;
+    for indices in boxes.values() {
+        let mut group: HashMap<&str, &ModelFace> = HashMap::new();
+        for &index in indices {
+            let face = &faces[index];
+            group.entry(face.face.as_str()).or_insert(face);
+        }
+
+        for &index in indices {
+            let face = &faces[index];
+            if face.rect.width == 0
+                || face.rect.height == 0
+                || face.rect.x >= source_width
+                || face.rect.y >= source_height
+            {
+                continue;
+            }
+
+            let padded = build_padded_tile(image, face, &group, 1);
+            let upscaled = upscale_image(
+                &padded,
+                None,
+                &UpscaleConfig {
+                    factor,
+                    stitch_faces: false,
+                },
+            )?;
+            let cropped = image::imageops::crop_imm(
+                &upscaled,
+                factor,
+                factor,
+                face.rect.width * factor,
+                face.rect.height * factor,
+            )
+            .to_image();
+
+            for y in 0..cropped.height() {
+                let output_y = face.rect.y * factor + y;
+                if output_y >= output_height {
+                    break;
+                }
+                for x in 0..cropped.width() {
+                    let output_x = face.rect.x * factor + x;
+                    if output_x >= output_width {
+                        break;
+                    }
+                    output.put_pixel(output_x, output_y, *cropped.get_pixel(x, y));
+                }
+            }
+        }
     }
 
     Ok(output)
+}
+
+/// Distinct cube/element groups among the faces (used for status messages).
+pub fn box_count(faces: &[ModelFace]) -> usize {
+    faces.iter().map(|face| face.group).collect::<HashSet<_>>().len()
 }
 
 fn copy_rgba_buffer(output: &mut RgbaImage, rgba: &[u8]) {
@@ -116,175 +480,10 @@ fn copy_rgba_buffer(output: &mut RgbaImage, rgba: &[u8]) {
     target[..len].copy_from_slice(&rgba[..len]);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RegionBounds {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-}
-
-fn bounds_of_faces(faces: &[&ModelFace]) -> Option<RegionBounds> {
-    let mut min_x = u32::MAX;
-    let mut min_y = u32::MAX;
-    let mut max_x = u32::MIN;
-    let mut max_y = u32::MIN;
-
-    for model_face in faces {
-        let rect = &model_face.rect;
-        min_x = min_x.min(rect.x);
-        min_y = min_y.min(rect.y);
-        max_x = max_x.max(rect.right());
-        max_y = max_y.max(rect.bottom());
-    }
-
-    if min_x >= max_x || min_y >= max_y {
-        return None;
-    }
-
-    Some(RegionBounds {
-        x: min_x,
-        y: min_y,
-        width: max_x - min_x,
-        height: max_y - min_y,
-    })
-}
-
-fn upscale_group_into(
-    source: &RgbaImage,
-    output: &mut RgbaImage,
-    group: &[&ModelFace],
-    bounds: &RegionBounds,
-    factor: u32,
-) -> Result<(), String> {
-    if bounds.width == 0 || bounds.height == 0 {
-        return Ok(());
-    }
-
-    let mut region = RgbaImage::new(bounds.width, bounds.height);
-    for y in 0..bounds.height {
-        for x in 0..bounds.width {
-            let source_x = bounds.x + x;
-            let source_y = bounds.y + y;
-            if source_x < source.width() && source_y < source.height() {
-                region.put_pixel(x, y, *source.get_pixel(source_x, source_y));
-            }
-        }
-    }
-
-    let scaled_width = bounds.width * factor;
-    let scaled_height = bounds.height * factor;
-    let scaled = scale_rgba(
-        region.as_raw(),
-        bounds.width as usize,
-        bounds.height as usize,
-        factor as usize,
-    );
-    let scaled_image = RgbaImage::from_raw(scaled_width, scaled_height, scaled)
-        .ok_or_else(|| "xBRZ produced an invalid group buffer".to_string())?;
-
-    let member_rects: Vec<FaceRect> = group.iter().map(|face| face.rect).collect();
-
-    for member in &member_rects {
-        let local_x_start = (member.x - bounds.x) * factor;
-        let local_y_start = (member.y - bounds.y) * factor;
-        let width = member.width * factor;
-        let height = member.height * factor;
-
-        for y in 0..height {
-            for x in 0..width {
-                let scaled_pixel = *scaled_image.get_pixel(local_x_start + x, local_y_start + y);
-                let output_x = member.x * factor + x;
-                let output_y = member.y * factor + y;
-                if output_x < output.width() && output_y < output.height() {
-                    output.put_pixel(output_x, output_y, scaled_pixel);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-pub fn group_stitch_faces(
-    faces: &[ModelFace],
-    atlas_width: u32,
-    atlas_height: u32,
-) -> Vec<Vec<usize>> {
-    let mut parent: Vec<usize> = (0..faces.len()).collect();
-
-    for (index, face) in faces.iter().enumerate() {
-        for other_index in (index + 1)..faces.len() {
-            let other = &faces[other_index];
-            if within_atlas(&face.rect, atlas_width, atlas_height)
-                && within_atlas(&other.rect, atlas_width, atlas_height)
-                && rects_share_edge(&face.rect, &other.rect)
-            {
-                union(&mut parent, index, other_index);
-            }
-        }
-    }
-
-    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
-    for index in 0..faces.len() {
-        let root = find(&mut parent, index);
-        groups.entry(root).or_default().push(index);
-    }
-
-    groups.into_values().collect()
-}
-
-fn within_atlas(rect: &FaceRect, width: u32, height: u32) -> bool {
-    rect.x < width
-        && rect.y < height
-        && rect.right() <= width
-        && rect.bottom() <= height
-}
-
-fn rects_share_edge(a: &FaceRect, b: &FaceRect) -> bool {
-    if a.width == 0 || a.height == 0 || b.width == 0 || b.height == 0 {
-        return false;
-    }
-
-    let horizontal_neighbors = (a.right() == b.x || b.right() == a.x)
-        && intervals_overlap(a.y, a.bottom(), b.y, b.bottom());
-    let vertical_neighbors = (a.bottom() == b.y || b.bottom() == a.y)
-        && intervals_overlap(a.x, a.right(), b.x, b.right());
-
-    horizontal_neighbors || vertical_neighbors
-}
-
-fn intervals_overlap(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> bool {
-    a_start < b_end && b_start < a_end
-}
-
-fn find(parent: &mut [usize], node: usize) -> usize {
-    let mut root = node;
-    while parent[root] != root {
-        root = parent[root];
-    }
-
-    let mut current = node;
-    while parent[current] != root {
-        let next = parent[current];
-        parent[current] = root;
-        current = next;
-    }
-
-    root
-}
-
-fn union(parent: &mut [usize], a: usize, b: usize) {
-    let root_a = find(parent, a);
-    let root_b = find(parent, b);
-    if root_a != root_b {
-        parent[root_b] = root_a;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use Edge::*;
 
     fn face(x: u32, y: u32, width: u32, height: u32) -> ModelFace {
         ModelFace {
@@ -296,7 +495,71 @@ mod tests {
                 height,
             },
             face: "north".into(),
+            group: 0,
         }
+    }
+
+    /// Box-UV fixture: cube with dx=dy=dz=2, uv(0,0) on an 8×4 image where
+    /// pixel = (x, y, 0, 255).
+    fn box_fixture() -> (RgbaImage, Vec<ModelFace>) {
+        let mut image = RgbaImage::new(8, 4);
+        for y in 0..4 {
+            for x in 0..8 {
+                image.put_pixel(x, y, Rgba([x as u8, y as u8, 0, 255]));
+            }
+        }
+        let rect = |x, y, width, height| FaceRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let faces = vec![
+            ModelFace {
+                texture: String::new(),
+                rect: rect(2, 0, 2, 2),
+                face: "down".into(),
+                group: 0,
+            },
+            ModelFace {
+                texture: String::new(),
+                rect: rect(4, 0, 2, 2),
+                face: "up".into(),
+                group: 0,
+            },
+            ModelFace {
+                texture: String::new(),
+                rect: rect(4, 2, 2, 2),
+                face: "east".into(),
+                group: 0,
+            },
+            ModelFace {
+                texture: String::new(),
+                rect: rect(2, 2, 2, 2),
+                face: "north".into(),
+                group: 0,
+            },
+            ModelFace {
+                texture: String::new(),
+                rect: rect(0, 2, 2, 2),
+                face: "west".into(),
+                group: 0,
+            },
+            ModelFace {
+                texture: String::new(),
+                rect: rect(6, 2, 2, 2),
+                face: "south".into(),
+                group: 0,
+            },
+        ];
+        (image, faces)
+    }
+
+    fn group_map<'a>(faces: &'a [ModelFace]) -> HashMap<&'a str, &'a ModelFace> {
+        faces
+            .iter()
+            .map(|face| (face.face.as_str(), face))
+            .collect()
     }
 
     #[test]
@@ -316,45 +579,68 @@ mod tests {
     }
 
     #[test]
-    fn detects_edge_neighbors() {
-        assert!(rects_share_edge(
-            &FaceRect {
-                x: 0,
-                y: 0,
-                width: 8,
-                height: 8
-            },
-            &FaceRect {
-                x: 8,
-                y: 0,
-                width: 8,
-                height: 8
-            },
-        ));
-        assert!(!rects_share_edge(
-            &FaceRect {
-                x: 0,
-                y: 0,
-                width: 8,
-                height: 8
-            },
-            &FaceRect {
-                x: 8,
-                y: 8,
-                width: 8,
-                height: 8
-            },
-        ));
+    fn neighbor_table_covers_all_faces() {
+        for name in ["down", "up", "west", "north", "east", "south"] {
+            for edge in [Top, Bottom, Left, Right] {
+                assert!(
+                    neighbor_edge(name, edge).is_some(),
+                    "missing neighbor for {name}/{edge:?}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn groups_connected_faces() {
-        let faces = vec![face(0, 0, 8, 8), face(8, 0, 8, 8), face(0, 16, 8, 8)];
+    fn neighbor_table_is_symmetric() {
+        for name in ["down", "up", "west", "north", "east", "south"] {
+            for edge in [Top, Bottom, Left, Right] {
+                let (neighbor, n_edge, rev) = neighbor_edge(name, edge).unwrap();
+                let (back, back_edge, back_rev) = neighbor_edge(neighbor, n_edge).unwrap();
+                assert_eq!((back, back_edge, back_rev), (name, edge, rev));
+            }
+        }
+    }
 
-        let groups = group_stitch_faces(&faces, 16, 24);
-        let mut sizes: Vec<usize> = groups.iter().map(Vec::len).collect();
-        sizes.sort_unstable();
-        assert_eq!(sizes, vec![1, 2]);
+    #[test]
+    fn builds_tile_with_neighbor_strips() {
+        let (image, faces) = box_fixture();
+        let group = group_map(&faces);
+        let find = |name: &str| faces.iter().find(|face| face.face == name).unwrap();
+
+        // west.Top comes from down's left column (atlas row 0): src(2,0),(2,1).
+        let west = build_padded_tile(&image, find("west"), &group, 1);
+        assert_eq!(west.dimensions(), (4, 4));
+        assert_eq!(*west.get_pixel(1, 0), Rgba([2, 0, 0, 255]));
+        assert_eq!(*west.get_pixel(2, 0), Rgba([2, 1, 0, 255]));
+
+        // south.Right comes from west's left column (far across the atlas):
+        // src(0,2),(0,3) — the seam the old bbox grouping missed.
+        let south = build_padded_tile(&image, find("south"), &group, 1);
+        assert_eq!(*south.get_pixel(3, 1), Rgba([0, 2, 0, 255]));
+        assert_eq!(*south.get_pixel(3, 2), Rgba([0, 3, 0, 255]));
+
+        // down.Right comes from east's top row, reversed: src(5,2),src(4,2).
+        let down = build_padded_tile(&image, find("down"), &group, 1);
+        assert_eq!(*down.get_pixel(3, 1), Rgba([5, 2, 0, 255]));
+        assert_eq!(*down.get_pixel(3, 2), Rgba([4, 2, 0, 255]));
+
+        // Corner: west's top-left corner uses down's left column start.
+        assert_eq!(*west.get_pixel(0, 0), Rgba([2, 0, 0, 255]));
+    }
+
+    #[test]
+    fn lone_face_wraps_own_opposite_edges() {
+        let (image, faces) = box_fixture();
+        let north = faces
+            .iter()
+            .find(|face| face.face == "north")
+            .unwrap()
+            .clone();
+        let group: HashMap<&str, &ModelFace> = [("north", &north)].into_iter().collect();
+        // north.Top falls back to the face's own bottom row: src(2,3),(3,3).
+        let tile = build_padded_tile(&image, &north, &group, 1);
+        assert_eq!(*tile.get_pixel(1, 0), Rgba([2, 3, 0, 255]));
+        assert_eq!(*tile.get_pixel(2, 0), Rgba([3, 3, 0, 255]));
     }
 
     #[test]
@@ -410,69 +696,40 @@ mod tests {
     }
 
     #[test]
-    fn stitched_neighbors_share_context() {
-        let mut image = RgbaImage::new(16, 8);
-        for y in 0..8 {
-            for x in 0..8 {
-                image.put_pixel(x, y, Rgba([220, 40, 40, 255]));
-            }
-            for x in 8..16 {
-                image.put_pixel(x, y, Rgba([40, 40, 220, 255]));
-            }
-        }
-
-        let faces = vec![face(0, 0, 8, 8), face(8, 0, 8, 8)];
+    fn box_faces_stitch_dims_and_border_context() {
+        let (image, faces) = box_fixture();
         let config = UpscaleConfig {
             factor: 4,
             stitch_faces: true,
         };
         let stitched = upscale_image(&image, Some(&faces), &config).unwrap();
+        assert_eq!(stitched.dimensions(), (32, 16));
 
-        let mut independent = RgbaImage::from_pixel(64, 32, Rgba([0, 0, 0, 0]));
-        for model_face in &faces {
-            let rect = model_face.rect;
-            let mut region = RgbaImage::new(rect.width, rect.height);
-            for y in 0..rect.height {
-                for x in 0..rect.width {
-                    region.put_pixel(x, y, *image.get_pixel(rect.x + x, rect.y + y));
-                }
-            }
-            let scaled = scale_rgba(
-                region.as_raw(),
-                rect.width as usize,
-                rect.height as usize,
-                config.factor as usize,
-            );
-            let scaled_image = RgbaImage::from_raw(
-                rect.width * config.factor,
-                rect.height * config.factor,
-                scaled,
-            )
-            .unwrap();
-            for y in 0..scaled_image.height() {
-                for x in 0..scaled_image.width() {
-                    independent.put_pixel(
-                        rect.x * config.factor + x,
-                        rect.y * config.factor + y,
-                        *scaled_image.get_pixel(x, y),
-                    );
+        let plain = upscale_image(
+            &image,
+            None,
+            &UpscaleConfig {
+                factor: 4,
+                stitch_faces: false,
+            },
+        )
+        .unwrap();
+        // down occupies dest x8..15, y0..7 — its border rows/columns must use
+        // neighbor context, so the stitched output differs from plain xBRZ
+        // somewhere inside that box.
+        let mut differs = false;
+        for y in 0..8 {
+            for x in 8..16 {
+                if stitched.get_pixel(x, y).0 != plain.get_pixel(x, y).0 {
+                    differs = true;
                 }
             }
         }
+        assert!(differs, "stitched face border should use neighbor context");
 
-        assert_eq!(stitched.dimensions(), (64, 32));
-        let mut differs_at_seam = false;
-        for y in 0..stitched.height() {
-            if stitched.get_pixel(31, y).0 != independent.get_pixel(31, y).0
-                || stitched.get_pixel(32, y).0 != independent.get_pixel(32, y).0
-            {
-                differs_at_seam = true;
-                break;
-            }
-        }
-        assert!(
-            differs_at_seam,
-            "stitched seam should use combined face context"
-        );
+        assert_eq!(box_count(&faces), 1);
+        let mut second = face(0, 4, 2, 2);
+        second.group = 1;
+        assert_eq!(box_count(&[face(0, 0, 2, 2), second]), 2);
     }
 }

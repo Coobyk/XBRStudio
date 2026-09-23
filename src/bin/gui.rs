@@ -10,7 +10,7 @@ use gpui::{
 };
 use image::RgbaImage;
 
-use xbrstudio::jar::{BatchOptions, BatchProgress, JarMessage, is_block_texture_path, spawn_batch};
+use xbrstudio::jar::{BatchOptions, BatchProgress, JarMessage, is_wrap_texture_path, spawn_batch};
 use xbrstudio::model::{load_model, ModelFaces};
 use xbrstudio::upscaling::{upscale_image, upscale_wrapped, UpscaleConfig};
 
@@ -344,6 +344,12 @@ impl AppView {
                                                     report.stitched, report.entity_models
                                                 ));
                                             }
+                                            if !report.unmatched_entity.is_empty() {
+                                                summary.push_str(&format!(
+                                                    ", {} entity textures unmatched",
+                                                    report.unmatched_entity.len()
+                                                ));
+                                            }
                                             if !report.errors.is_empty() {
                                                 let (path, message) = &report.errors[0];
                                                 summary.push_str(&format!(
@@ -432,10 +438,10 @@ impl AppView {
         let faces = self.model_faces.as_ref().map(|faces| faces.faces.clone());
         let stitch = self.stitch && faces.is_some();
         let wrap = !stitch
-            && !self
+            && self
                 .texture_path
                 .as_deref()
-                .is_some_and(is_block_texture_path);
+                .is_some_and(is_wrap_texture_path);
         let config = UpscaleConfig {
             factor: self.factor,
             stitch_faces: stitch,
@@ -449,15 +455,10 @@ impl AppView {
         match result {
             Ok(result) => {
                 let group_note = if stitch && faces.is_some() {
-                    let groups = xbrstudio::upscaling::group_stitch_faces(
-                        faces.as_deref().unwrap_or(&[]),
-                        source.width(),
-                        source.height(),
-                    );
                     format!(
-                        "; stitched {} faces into {} groups",
+                        "; stitched {} faces across {} boxes",
                         faces.as_ref().map(Vec::len).unwrap_or(0),
-                        groups.len()
+                        xbrstudio::upscaling::box_count(faces.as_deref().unwrap_or(&[]))
                     )
                 } else if wrap {
                     "; tiled wrap".to_string()
