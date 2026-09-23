@@ -89,6 +89,12 @@ pub fn is_wrap_texture_path(path: &Path) -> bool {
         .is_some_and(|name| name == "beacon_beam.png")
 }
 
+/// Grass/foliage colormaps (`textures/colormap/**`) — biome lookup tables,
+/// not something to upscale.
+pub fn is_colormap_texture_path(path: &str) -> bool {
+    path.starts_with("colormap/") || path.contains("/textures/colormap/")
+}
+
 struct EntityModel {
     faces: ModelFaces,
     has_texture_size: bool,
@@ -161,6 +167,13 @@ pub fn upscale_jar(
             .to_string();
         index_by_name.insert(name.clone(), index);
         if name.starts_with(TEXTURE_ROOT) && name.ends_with(".png") {
+            let short = name
+                .strip_prefix(TEXTURE_ROOT)
+                .map(str::to_string)
+                .unwrap_or_else(|| name.clone());
+            if is_colormap_texture_path(&short) {
+                continue;
+            }
             textures.push((index, name));
         }
     }
@@ -847,7 +860,7 @@ mod tests {
     fn build_test_jar() -> Vec<u8> {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-        let files: [(&str, Vec<u8>); 9] = [
+        let files: [(&str, Vec<u8>); 10] = [
             (
                 "assets/minecraft/textures/block/stone.png",
                 png_bytes(4, 4, [200, 50, 50, 255]),
@@ -875,6 +888,10 @@ mod tests {
             (
                 "assets/minecraft/textures/entity/equipment/test_armor.png",
                 png_bytes(16, 16, [90, 90, 90, 255]),
+            ),
+            (
+                "assets/minecraft/textures/colormap/grass.png",
+                png_bytes(256, 256, [10, 200, 10, 255]),
             ),
             (
                 "version.json",
@@ -1393,6 +1410,17 @@ mod tests {
     }
 
     #[test]
+    fn colormap_paths_are_skipped() {
+        assert!(is_colormap_texture_path("colormap/grass.png"));
+        assert!(is_colormap_texture_path("colormap/foliage.png"));
+        assert!(is_colormap_texture_path(
+            "assets/minecraft/textures/colormap/grass.png"
+        ));
+        assert!(!is_colormap_texture_path("block/grass_block_side.png"));
+        assert!(!is_colormap_texture_path("entity/grass/grass.png"));
+    }
+
+    #[test]
     fn batch_upscales_jar_into_resource_pack() {
         let root = std::env::temp_dir().join(format!(
             "xbrstudio-jar-batch-{}",
@@ -1463,9 +1491,12 @@ mod tests {
         };
 
         let report = upscale_jar(&jar_path, &out_dir, &opts, |_| {}).unwrap();
-        assert_eq!(report.total, 5);
+        assert_eq!(report.total, 5, "colormap/grass.png must be skipped");
         assert_eq!(report.upscaled, 5, "errors: {:?}", report.errors);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(!out_dir
+            .join("assets/minecraft/textures/colormap/grass.png")
+            .exists());
         assert_eq!(report.animated, 1);
         assert_eq!(report.stitched, 2, "cow + wolf should stitch");
         assert_eq!(report.wrapped, 2, "stone + lava (block/) should wrap");
