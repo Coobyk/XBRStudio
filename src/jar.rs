@@ -2,15 +2,21 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use image::{DynamicImage, RgbaImage};
+use rayon::prelude::*;
 use serde_json::{Value, json};
 use zip::ZipArchive;
 
-use crate::model::{ModelFaces, parse_model, scale_model_faces_to_image};
+use crate::model::{
+    ModelFaces, block_texture_stems, is_atlas_layout, merge_model_faces, parse_model,
+    resolve_block_models, scale_model_faces_to_image,
+};
 use crate::upscaling::{UpscaleConfig, upscale_image, upscale_wrapped};
 
 pub const TEXTURE_ROOT: &str = "assets/minecraft/textures/";
+const BLOCK_MODEL_ROOT: &str = "assets/minecraft/models/block/";
 
 #[derive(Debug, Clone)]
 pub struct BatchReport {
@@ -23,6 +29,9 @@ pub struct BatchReport {
     pub wrapped: usize,
     pub errors: Vec<(String, String)>,
     pub entity_models: usize,
+    /// Distinct block texture stems with at least one stitchable model
+    /// (atlas-like UV layout after parent resolution).
+    pub block_models: usize,
     /// Non-animated `entity/` textures that found no model (or lost too many
     /// faces to the clip gate), sorted by path.
     pub unmatched_entity: Vec<String>,
@@ -33,6 +42,7 @@ pub enum BatchProgress {
     Started {
         total: usize,
         entity_models: usize,
+        block_models: usize,
     },
     Texture {
         done: usize,
@@ -142,11 +152,17 @@ pub fn spawn_batch(
     receiver
 }
 
+struct TextureJob {
+    name: String,
+    bytes: Vec<u8>,
+    mcmeta: Option<Vec<u8>>,
+}
+
 pub fn upscale_jar(
     jar_path: &Path,
     out_dir: &Path,
     opts: &BatchOptions,
-    mut progress: impl FnMut(BatchProgress),
+    progress: impl Fn(BatchProgress) + Sync,
 ) -> Result<BatchReport, String> {
     UpscaleConfig {
         factor: opts.factor,
@@ -190,13 +206,62 @@ pub fn upscale_jar(
     } else {
         Vec::new()
     };
+    let block_models = if opts.stitch {
+        load_block_models(&mut archive, &index_by_name)
+    } else {
+        HashMap::new()
+    };
     let pack_format = read_pack_format(&mut archive);
 
-    let total = textures.len();
+    // Load bytes up front so workers never share the ZipArchive.
+    let mut jobs = Vec::with_capacity(textures.len());
+    for (index, name) in textures {
+        let bytes = read_entry(&mut archive, index)?;
+        let mcmeta = match index_by_name.get(&format!("{name}.mcmeta")) {
+            Some(&mcmeta_index) => Some(read_entry(&mut archive, mcmeta_index)?),
+            None => None,
+        };
+        jobs.push(TextureJob {
+            name,
+            bytes,
+            mcmeta,
+        });
+    }
+
+    let total = jobs.len();
     progress(BatchProgress::Started {
         total,
         entity_models: models.len(),
+        block_models: block_models.len(),
     });
+
+    let done = AtomicUsize::new(0);
+    let results: Vec<(String, Result<ProcessOutcome, String>)> = jobs
+        .par_iter()
+        .map(|job| {
+            let short = job
+                .name
+                .strip_prefix(TEXTURE_ROOT)
+                .unwrap_or(&job.name)
+                .to_string();
+            let outcome = process_one(
+                &job.name,
+                &job.bytes,
+                job.mcmeta.as_deref(),
+                out_dir,
+                opts,
+                &models,
+                &block_models,
+            );
+            let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
+            progress(BatchProgress::Texture {
+                done: completed,
+                total,
+                name: short,
+            });
+            (job.name.clone(), outcome)
+        })
+        .collect();
 
     let mut report = BatchReport {
         total,
@@ -207,26 +272,13 @@ pub fn upscale_jar(
         wrapped: 0,
         errors: Vec::new(),
         entity_models: models.len(),
+        block_models: block_models.len(),
         unmatched_entity: Vec::new(),
     };
 
-    for (position, (index, name)) in textures.iter().enumerate() {
-        let short = name.strip_prefix(TEXTURE_ROOT).unwrap_or(name);
-        progress(BatchProgress::Texture {
-            done: position + 1,
-            total,
-            name: short.to_string(),
-        });
-
-        match process_one(
-            &mut archive,
-            *index,
-            name,
-            &index_by_name,
-            out_dir,
-            opts,
-            &models,
-        ) {
+    for (name, outcome) in results {
+        let short = name.strip_prefix(TEXTURE_ROOT).unwrap_or(&name);
+        match outcome {
             Ok(outcome) => {
                 if outcome.copied {
                     report.copied += 1;
@@ -257,6 +309,7 @@ pub fn upscale_jar(
         report.errors.push(("pack.mcmeta".into(), error));
     }
 
+    report.errors.sort();
     report.unmatched_entity.sort();
     Ok(report)
 }
@@ -273,16 +326,15 @@ fn read_entry(archive: &mut ZipArchive<File>, index: usize) -> Result<Vec<u8>, S
 }
 
 fn process_one(
-    archive: &mut ZipArchive<File>,
-    index: usize,
     name: &str,
-    index_by_name: &HashMap<String, usize>,
+    bytes: &[u8],
+    mcmeta_bytes: Option<&[u8]>,
     out_dir: &Path,
     opts: &BatchOptions,
     models: &[EntityModel],
+    block_models: &HashMap<String, ModelFaces>,
 ) -> Result<ProcessOutcome, String> {
     let relative = name.strip_prefix(TEXTURE_ROOT).unwrap_or(name);
-    let bytes = read_entry(archive, index)?;
 
     if is_colormap_texture_path(relative) {
         let out_path = out_dir.join(Path::new(name));
@@ -290,7 +342,7 @@ fn process_one(
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
         }
-        std::fs::write(&out_path, &bytes)
+        std::fs::write(&out_path, bytes)
             .map_err(|error| format!("cannot write {}: {error}", out_path.display()))?;
         return Ok(ProcessOutcome {
             animated: false,
@@ -300,55 +352,69 @@ fn process_one(
         });
     }
 
-    let image = image::load_from_memory(&bytes)
+    let image = image::load_from_memory(bytes)
         .map_err(|error| format!("decode PNG: {error}"))?
         .to_rgba8();
     if image.width() == 0 || image.height() == 0 {
         return Err("zero-size texture".into());
     }
 
-    let mcmeta_bytes = match index_by_name.get(&format!("{name}.mcmeta")) {
-        Some(&mcmeta_index) => Some(read_entry(archive, mcmeta_index)?),
-        None => None,
-    };
-    let mcmeta_value: Option<Value> = mcmeta_bytes
-        .as_ref()
-        .and_then(|bytes| serde_json::from_slice(bytes).ok());
+    let mcmeta_value: Option<Value> =
+        mcmeta_bytes.and_then(|bytes| serde_json::from_slice(bytes).ok());
     let is_animated = mcmeta_value
         .as_ref()
         .is_some_and(|value| value.get("animation").is_some_and(|item| !item.is_null()));
 
-    let wrap = opts.wrap && wants_wrap(relative);
+    let mut wrap = opts.wrap && wants_wrap(relative);
+    let block_stem = block_texture_stem_for(relative);
+    let block_model = if opts.stitch {
+        block_stem
+            .as_deref()
+            .and_then(|stem| block_models.get(stem))
+            .filter(|model| is_atlas_layout(&model.faces))
+    } else {
+        None
+    };
 
     let (output, out_mcmeta, animated, stitched) = if is_animated {
         let value = mcmeta_value.clone().expect("checked above");
         let animation = value.get("animation").expect("checked above");
-        let upscaled = upscale_animated(&image, animation, opts.factor, wrap)?;
+        let (upscaled, stitched) =
+            upscale_animated(&image, animation, opts.factor, wrap, block_model)?;
+        if stitched {
+            wrap = false;
+        }
         let mut scaled_value = value;
         scale_animation_fields(&mut scaled_value, opts.factor);
         let encoded =
             serde_json::to_vec(&scaled_value).map_err(|error| format!("encode mcmeta: {error}"))?;
-        (upscaled, Some(encoded), true, false)
+        (upscaled, Some(encoded), true, stitched)
     } else {
         let mut local_model: Option<ModelFaces> = None;
-        if opts.stitch {
-            if let Some(ctx) = texture_ctx(relative) {
-                if let Some(model) = best_model_for(models, &ctx, (image.width(), image.height())) {
-                    let original_faces = model.faces.faces.len();
-                    let mut model_faces = model.faces.clone();
-                    if !model.has_texture_size {
-                        model_faces.uv_size = (image.width() as f32, image.height() as f32);
-                    }
-                    scale_model_faces_to_image(&mut model_faces, &image);
-                    if !model_faces.faces.is_empty()
-                        && model_faces.faces.len() * 2 >= original_faces
-                    {
-                        local_model = Some(model_faces);
-                    }
-                }
+        if let Some(model) = block_model {
+            let mut model_faces = model.clone();
+            scale_model_faces_to_image(&mut model_faces, &image);
+            if !model_faces.faces.is_empty() {
+                local_model = Some(model_faces);
+            }
+        } else if opts.stitch
+            && let Some(ctx) = texture_ctx(relative)
+            && let Some(model) = best_model_for(models, &ctx, (image.width(), image.height()))
+        {
+            let original_faces = model.faces.faces.len();
+            let mut model_faces = model.faces.clone();
+            if !model.has_texture_size {
+                model_faces.uv_size = (image.width() as f32, image.height() as f32);
+            }
+            scale_model_faces_to_image(&mut model_faces, &image);
+            if !model_faces.faces.is_empty() && model_faces.faces.len() * 2 >= original_faces {
+                local_model = Some(model_faces);
             }
         }
         let stitched = local_model.is_some();
+        if stitched {
+            wrap = false;
+        }
         let upscaled = if stitched {
             upscale_image(
                 &image,
@@ -370,7 +436,12 @@ fn process_one(
                 },
             )?
         };
-        (upscaled, mcmeta_bytes, false, stitched)
+        (
+            upscaled,
+            mcmeta_bytes.map(|bytes| bytes.to_vec()),
+            false,
+            stitched,
+        )
     };
 
     let out_path = out_dir.join(Path::new(name));
@@ -407,30 +478,52 @@ fn upscale_animated(
     animation: &Value,
     factor: u32,
     wrap: bool,
-) -> Result<RgbaImage, String> {
+    model: Option<&ModelFaces>,
+) -> Result<(RgbaImage, bool), String> {
     let (_frame_width, frame_height) =
         animation_frame_size(image.width(), image.height(), animation);
     let frame_count = (image.height() / frame_height).max(1);
 
-    let mut bands: Vec<RgbaImage> = Vec::with_capacity(frame_count as usize);
-    for frame in 0..frame_count {
-        let y = frame * frame_height;
-        let band_height = frame_height.min(image.height() - y);
-        let band = image::imageops::crop_imm(image, 0, y, image.width(), band_height).to_image();
-        let scaled = if wrap {
-            upscale_wrapped(&band, factor)?
-        } else {
-            upscale_image(
-                &band,
-                None,
-                &UpscaleConfig {
-                    factor,
-                    stitch_faces: false,
-                },
-            )?
-        };
-        bands.push(scaled);
-    }
+    let bands: Result<Vec<(RgbaImage, bool)>, String> = (0..frame_count)
+        .into_par_iter()
+        .map(|frame| {
+            let y = frame * frame_height;
+            let band_height = frame_height.min(image.height() - y);
+            let band =
+                image::imageops::crop_imm(image, 0, y, image.width(), band_height).to_image();
+            if let Some(model) = model {
+                let mut model_faces = model.clone();
+                scale_model_faces_to_image(&mut model_faces, &band);
+                if !model_faces.faces.is_empty() {
+                    return upscale_image(
+                        &band,
+                        Some(model_faces.faces.as_slice()),
+                        &UpscaleConfig {
+                            factor,
+                            stitch_faces: true,
+                        },
+                    )
+                    .map(|image| (image, true));
+                }
+            }
+            let upscaled = if wrap {
+                upscale_wrapped(&band, factor)
+            } else {
+                upscale_image(
+                    &band,
+                    None,
+                    &UpscaleConfig {
+                        factor,
+                        stitch_faces: false,
+                    },
+                )
+            };
+            upscaled.map(|image| (image, false))
+        })
+        .collect();
+    let bands = bands?;
+    let stitched_any = bands.iter().any(|(_, stitched)| *stitched);
+    let bands: Vec<RgbaImage> = bands.into_iter().map(|(image, _)| image).collect();
 
     let out_width = image.width() * factor;
     let out_height: u32 = bands.iter().map(RgbaImage::height).sum();
@@ -445,7 +538,7 @@ fn upscale_animated(
         }
         y += height;
     }
-    Ok(out)
+    Ok((out, stitched_any))
 }
 
 fn animation_frame_size(width: u32, height: u32, animation: &Value) -> (u32, u32) {
@@ -828,6 +921,91 @@ fn load_entity_models(model_dir: &Path) -> Vec<EntityModel> {
     models
 }
 
+/// Relative `block/<stem>` from a texture path under `textures/`, if any.
+fn block_texture_stem_for(relative: &str) -> Option<String> {
+    let rest = relative.strip_prefix("block/")?;
+    let stem = rest.strip_suffix(".png")?;
+    if stem.is_empty() || stem.contains('/') {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
+/// Load `models/block/*.json` from the jar, resolve parent chains, and index
+/// atlas-like models by block texture stem (merged across models that
+/// reference the same texture).
+fn load_block_models(
+    archive: &mut ZipArchive<File>,
+    index_by_name: &HashMap<String, usize>,
+) -> HashMap<String, ModelFaces> {
+    let mut raw: HashMap<String, Value> = HashMap::new();
+    let mut names: Vec<&String> = index_by_name
+        .keys()
+        .filter(|name| name.starts_with(BLOCK_MODEL_ROOT) && name.ends_with(".json"))
+        .collect();
+    names.sort();
+    for name in names {
+        let Some(&index) = index_by_name.get(name) else {
+            continue;
+        };
+        let Ok(bytes) = read_entry(archive, index) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let short = name
+            .trim_end_matches(".json")
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if !short.is_empty() {
+            raw.insert(short, value);
+        }
+    }
+
+    let resolved = resolve_block_models(&raw);
+    let mut by_stem: HashMap<String, Vec<(String, ModelFaces)>> = HashMap::new();
+    for (key, value) in &resolved {
+        let Ok(parsed) = parse_model(value) else {
+            continue;
+        };
+        if parsed.faces.is_empty() {
+            continue;
+        }
+        for stem in block_texture_stems(&parsed.textures) {
+            by_stem
+                .entry(stem)
+                .or_default()
+                .push((key.clone(), parsed.clone()));
+        }
+    }
+
+    by_stem
+        .into_iter()
+        .filter_map(|(stem, models)| {
+            // Prefer the same-name model (lantern.png → lantern.json) when it
+            // exists; otherwise merge every model that references the texture.
+            let chosen: Vec<ModelFaces> = models
+                .iter()
+                .filter(|(key, _)| *key == stem)
+                .map(|(_, model)| model.clone())
+                .collect();
+            let chosen = if chosen.is_empty() {
+                models.into_iter().map(|(_, model)| model).collect()
+            } else {
+                chosen
+            };
+            let merged = merge_model_faces(&chosen)?;
+            if !is_atlas_layout(&merged.faces) {
+                return None;
+            }
+            Some((stem, merged))
+        })
+        .collect()
+}
+
 fn collect_json_files(directory: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
@@ -900,47 +1078,97 @@ mod tests {
     fn build_test_jar() -> Vec<u8> {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-        let files: [(&str, Vec<u8>); 10] = [
+        let lantern_model = json!({
+            "parent": "block/block",
+            "textures": {"lantern": "minecraft:block/lantern"},
+            "elements": [{
+                "from": [0, 0, 0],
+                "to": [16, 16, 16],
+                "faces": {
+                    "north": {"uv": [0, 0, 8, 8], "texture": "#lantern"},
+                    "east": {"uv": [8, 0, 16, 8], "texture": "#lantern"},
+                    "south": {"uv": [0, 8, 8, 16], "texture": "#lantern"},
+                    "west": {"uv": [8, 8, 16, 16], "texture": "#lantern"}
+                }
+            }]
+        });
+        let cube_model = json!({
+            "parent": "block/block",
+            "textures": {"all": "minecraft:block/dirt"},
+            "elements": [{
+                "from": [0, 0, 0],
+                "to": [16, 16, 16],
+                "faces": {
+                    "down": {"texture": "#all"},
+                    "up": {"texture": "#all"},
+                    "north": {"texture": "#all"},
+                    "south": {"texture": "#all"},
+                    "west": {"texture": "#all"},
+                    "east": {"texture": "#all"}
+                }
+            }]
+        });
+        let files: Vec<(String, Vec<u8>)> = vec![
             (
-                "assets/minecraft/textures/block/stone.png",
+                "assets/minecraft/textures/block/stone.png".into(),
                 png_bytes(4, 4, [200, 50, 50, 255]),
             ),
             (
-                "assets/minecraft/textures/block/stone.png.mcmeta",
+                "assets/minecraft/textures/block/stone.png.mcmeta".into(),
                 br#"{"texture":{"mipmap_strategy":"cutout"}}"#.to_vec(),
             ),
             (
-                "assets/minecraft/textures/block/lava_still.png",
+                "assets/minecraft/textures/block/lava_still.png".into(),
                 png_bytes(4, 12, [255, 100, 0, 255]),
             ),
             (
-                "assets/minecraft/textures/block/lava_still.png.mcmeta",
+                "assets/minecraft/textures/block/lava_still.png.mcmeta".into(),
                 br#"{"animation":{"frametime":2,"width":4,"height":4}}"#.to_vec(),
             ),
             (
-                "assets/minecraft/textures/entity/cow/test_cow.png",
+                "assets/minecraft/textures/block/lantern.png".into(),
+                png_bytes(8, 8, [40, 40, 50, 255]),
+            ),
+            (
+                "assets/minecraft/textures/block/dirt.png".into(),
+                png_bytes(4, 4, [120, 80, 50, 255]),
+            ),
+            (
+                "assets/minecraft/models/block/lantern.json".into(),
+                lantern_model.to_string().into_bytes(),
+            ),
+            (
+                "assets/minecraft/models/block/dirt.json".into(),
+                cube_model.to_string().into_bytes(),
+            ),
+            (
+                "assets/minecraft/models/block/block.json".into(),
+                br#"{"gui_light":"side"}"#.to_vec(),
+            ),
+            (
+                "assets/minecraft/textures/entity/cow/test_cow.png".into(),
                 png_bytes(16, 16, [120, 80, 40, 255]),
             ),
             (
-                "assets/minecraft/textures/entity/wolf/wolf.png",
+                "assets/minecraft/textures/entity/wolf/wolf.png".into(),
                 png_bytes(32, 16, [160, 160, 160, 255]),
             ),
             (
-                "assets/minecraft/textures/entity/equipment/test_armor.png",
+                "assets/minecraft/textures/entity/equipment/test_armor.png".into(),
                 png_bytes(16, 16, [90, 90, 90, 255]),
             ),
             (
-                "assets/minecraft/textures/colormap/grass.png",
+                "assets/minecraft/textures/colormap/grass.png".into(),
                 png_bytes(256, 256, [10, 200, 10, 255]),
             ),
             (
-                "version.json",
+                "version.json".into(),
                 br#"{"pack_version":{"resource_major":97,"resource_minor":1}}"#.to_vec(),
             ),
-            ("net/minecraft/Client.class", vec![0u8; 4]),
+            ("net/minecraft/Client.class".into(), vec![0u8; 4]),
         ];
         for (name, bytes) in &files {
-            writer.start_file(*name, options).unwrap();
+            writer.start_file(name.as_str(), options).unwrap();
             writer.write_all(bytes).unwrap();
         }
         writer.finish().unwrap().into_inner()
@@ -1564,6 +1792,16 @@ mod tests {
     }
 
     #[test]
+    fn block_texture_stem_for_relative_paths() {
+        assert_eq!(
+            block_texture_stem_for("block/lantern.png").as_deref(),
+            Some("lantern")
+        );
+        assert_eq!(block_texture_stem_for("entity/cow/cow.png"), None);
+        assert_eq!(block_texture_stem_for("block/sub/x.png"), None);
+    }
+
+    #[test]
     fn batch_upscales_jar_into_resource_pack() {
         let root = std::env::temp_dir().join(format!("xbrstudio-jar-batch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1631,8 +1869,8 @@ mod tests {
         };
 
         let report = upscale_jar(&jar_path, &out_dir, &opts, |_| {}).unwrap();
-        assert_eq!(report.total, 6, "errors: {:?}", report.errors);
-        assert_eq!(report.upscaled, 5, "errors: {:?}", report.errors);
+        assert_eq!(report.total, 8, "errors: {:?}", report.errors);
+        assert_eq!(report.upscaled, 7, "errors: {:?}", report.errors);
         assert_eq!(report.copied, 1, "colormap/grass.png must be copied");
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         let grass_out = out_dir.join("assets/minecraft/textures/colormap/grass.png");
@@ -1643,9 +1881,16 @@ mod tests {
             "colormap must be copied byte-for-byte, not re-encoded upscaled"
         );
         assert_eq!(report.animated, 1);
-        assert_eq!(report.stitched, 2, "cow + wolf should stitch");
-        assert_eq!(report.wrapped, 2, "stone + lava (block/) should wrap");
+        assert_eq!(
+            report.stitched, 3,
+            "cow + wolf + lantern (atlas block model) should stitch"
+        );
+        assert_eq!(
+            report.wrapped, 3,
+            "stone + lava + dirt (full-UV cube) should wrap"
+        );
         assert_eq!(report.entity_models, 2);
+        assert_eq!(report.block_models, 1, "only lantern is atlas-like");
         assert_eq!(
             report.unmatched_entity,
             vec!["entity/equipment/test_armor.png".to_string()],
@@ -1654,6 +1899,13 @@ mod tests {
 
         let stone = image::open(out_dir.join("assets/minecraft/textures/block/stone.png")).unwrap();
         assert_eq!((stone.width(), stone.height()), (4 * 2, 4 * 2));
+
+        let lantern =
+            image::open(out_dir.join("assets/minecraft/textures/block/lantern.png")).unwrap();
+        assert_eq!((lantern.width(), lantern.height()), (8 * 2, 8 * 2));
+
+        let dirt = image::open(out_dir.join("assets/minecraft/textures/block/dirt.png")).unwrap();
+        assert_eq!((dirt.width(), dirt.height()), (4 * 2, 4 * 2));
 
         let lava =
             image::open(out_dir.join("assets/minecraft/textures/block/lava_still.png")).unwrap();

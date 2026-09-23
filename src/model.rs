@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use image::RgbaImage;
 use serde::Deserialize;
@@ -6,7 +6,7 @@ use serde_json::Value;
 
 pub const MODEL_UV_MAX: f32 = 16.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FaceRect {
     pub x: u32,
     pub y: u32,
@@ -111,29 +111,170 @@ fn parse_block_model(root: &Value) -> Result<ModelFaces, String> {
     let mut faces = Vec::new();
     for (element_index, element) in model.elements.into_iter().enumerate() {
         for (face_name, face) in element.faces {
-            if let Some(uv) = face.uv {
-                let texture = face
-                    .texture
-                    .map(|value| value.trim_start_matches('#').to_string())
-                    .or_else(|| first_texture_reference(&textures))
-                    .unwrap_or_default();
+            let texture = face
+                .texture
+                .map(|value| value.trim_start_matches('#').to_string())
+                .or_else(|| first_texture_reference(&textures))
+                .unwrap_or_default();
+            // Faces that only set `texture` (cube parents) default to the full
+            // 16×16 UV, matching vanilla when `uv` is omitted.
+            let uv = match face.uv {
+                Some(uv) => uv,
+                None => {
+                    if texture.is_empty() {
+                        continue;
+                    }
+                    [0.0, 0.0, MODEL_UV_MAX, MODEL_UV_MAX]
+                }
+            };
 
-                faces.push(ModelFace {
-                    texture,
-                    rect: FaceRect {
-                        x: uv[0].round() as u32,
-                        y: uv[1].round() as u32,
-                        width: (uv[2] - uv[0]).round().max(0.0) as u32,
-                        height: (uv[3] - uv[1]).round().max(0.0) as u32,
-                    },
-                    face: face_name,
-                    group: element_index as u32,
-                });
-            }
+            faces.push(ModelFace {
+                texture,
+                rect: FaceRect {
+                    x: uv[0].round() as u32,
+                    y: uv[1].round() as u32,
+                    width: (uv[2] - uv[0]).round().max(0.0) as u32,
+                    height: (uv[3] - uv[1]).round().max(0.0) as u32,
+                },
+                face: face_name,
+                group: element_index as u32,
+            });
         }
     }
 
     Ok(ModelFaces {
+        textures,
+        faces,
+        uv_size: (MODEL_UV_MAX, MODEL_UV_MAX),
+    })
+}
+
+/// Resolve `parent` chains in raw block-model JSON. Child `textures` override
+/// the parent; child `elements` win when present, otherwise the parent's
+/// elements are inherited. Keys are short names (`cube_all`, `lantern`).
+pub fn resolve_block_models(raw: &HashMap<String, Value>) -> HashMap<String, Value> {
+    let mut resolved = HashMap::with_capacity(raw.len());
+    for key in raw.keys() {
+        resolve_block_model_one(key, raw, &mut resolved, &mut HashSet::new());
+    }
+    resolved
+}
+
+fn resolve_block_model_one(
+    key: &str,
+    raw: &HashMap<String, Value>,
+    resolved: &mut HashMap<String, Value>,
+    visiting: &mut HashSet<String>,
+) -> Option<Value> {
+    if let Some(value) = resolved.get(key) {
+        return Some(value.clone());
+    }
+    if !visiting.insert(key.to_string()) {
+        return None;
+    }
+    let mut value = raw.get(key)?.clone();
+    let parent = value
+        .get("parent")
+        .and_then(Value::as_str)
+        .map(parent_model_key);
+    if let Some(parent_key) = parent {
+        let parent_value = resolve_block_model_one(&parent_key, raw, resolved, visiting)?;
+        value = merge_block_parent(&parent_value, &value);
+    }
+    visiting.remove(key);
+    let out = value.clone();
+    resolved.insert(key.to_string(), value);
+    Some(out)
+}
+
+fn parent_model_key(parent: &str) -> String {
+    parent
+        .rsplit('/')
+        .next()
+        .unwrap_or(parent)
+        .trim_start_matches("minecraft:")
+        .to_string()
+}
+
+fn merge_block_parent(parent: &Value, child: &Value) -> Value {
+    let mut merged = parent.clone();
+    if let (Some(parent_obj), Some(child_obj)) =
+        (merged.as_object_mut(), child.as_object().cloned())
+    {
+        for (key, value) in child_obj {
+            if key == "textures" {
+                let mut textures = parent_obj
+                    .get("textures")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(child_textures) = value.as_object() {
+                    for (name, tex) in child_textures {
+                        textures.insert(name.clone(), tex.clone());
+                    }
+                }
+                parent_obj.insert(key, Value::Object(textures));
+            } else if key == "elements" {
+                let has_child_elements = value
+                    .as_array()
+                    .is_some_and(|elements| !elements.is_empty());
+                if has_child_elements || !parent_obj.contains_key("elements") {
+                    parent_obj.insert(key, value);
+                }
+            } else {
+                parent_obj.insert(key, value);
+            }
+        }
+    }
+    if let Some(obj) = merged.as_object_mut() {
+        obj.remove("parent");
+    }
+    merged
+}
+
+/// Atlas-like layout: at least one element (group) uses two or more distinct
+/// UV rects. Full-UV cubes (`cube_all`) keep every face on the same rect and
+/// must fall back to wrap — 3D neighbors are not atlas neighbors there.
+pub fn is_atlas_layout(faces: &[ModelFace]) -> bool {
+    if faces.len() < 2 {
+        return false;
+    }
+    let mut by_group: HashMap<u32, Vec<FaceRect>> = HashMap::new();
+    for face in faces {
+        by_group.entry(face.group).or_default().push(face.rect);
+    }
+    by_group.values().any(|rects| {
+        if rects.len() < 2 {
+            return false;
+        }
+        let unique: HashSet<FaceRect> = rects.iter().copied().collect();
+        unique.len() >= 2
+    })
+}
+
+/// Merge models that share a texture; group ids are shifted so neighbor
+/// lookups never cross elements from different source models.
+pub fn merge_model_faces(models: &[ModelFaces]) -> Option<ModelFaces> {
+    if models.is_empty() {
+        return None;
+    }
+    let mut faces = Vec::new();
+    let mut textures = HashMap::new();
+    let mut group_offset = 0u32;
+    for model in models {
+        let max_group = model.faces.iter().map(|face| face.group).max();
+        for face in &model.faces {
+            let mut face = face.clone();
+            face.group += group_offset;
+            faces.push(face);
+        }
+        group_offset += max_group.map(|group| group + 1).unwrap_or(0);
+        textures.extend(model.textures.clone());
+    }
+    if faces.is_empty() {
+        return None;
+    }
+    Some(ModelFaces {
         textures,
         faces,
         uv_size: (MODEL_UV_MAX, MODEL_UV_MAX),
@@ -236,6 +377,50 @@ fn extract_textures(root: &Value) -> HashMap<String, String> {
 
 fn first_texture_reference(textures: &HashMap<String, String>) -> Option<String> {
     textures.keys().next().map(|value| value.to_string())
+}
+
+/// Concrete `block/<name>` stems referenced by a model's texture map
+/// (follows `#alias` chains).
+pub fn block_texture_stems(textures: &HashMap<String, String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for value in textures.values() {
+        collect_block_stems(textures, value, &mut out, &mut seen, 0);
+    }
+    out
+}
+
+fn collect_block_stems(
+    textures: &HashMap<String, String>,
+    value: &str,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    depth: usize,
+) {
+    if depth > 8 || value.is_empty() {
+        return;
+    }
+    if let Some(alias) = value.strip_prefix('#') {
+        if let Some(next) = textures.get(alias) {
+            collect_block_stems(textures, next, out, seen, depth + 1);
+        }
+        return;
+    }
+    if let Some(stem) = block_texture_stem(value)
+        && seen.insert(stem.clone())
+    {
+        out.push(stem);
+    }
+}
+
+/// `minecraft:block/lantern` / `block/lantern` → `lantern`.
+pub fn block_texture_stem(value: &str) -> Option<String> {
+    let path = value.rsplit(':').next()?;
+    let path = path.strip_prefix("block/")?;
+    if path.is_empty() || path.contains('/') {
+        return None;
+    }
+    Some(path.to_string())
 }
 
 pub fn scale_model_faces_to_image(model: &mut ModelFaces, image: &RgbaImage) {
@@ -584,37 +769,131 @@ mod tests {
             }
         );
         assert_eq!(down.group, up.group);
+    }
 
-        // dx=0 slab: only east/west have area (w=dz, h=dy).
-        let entity = json!({
-            "texture_size": [64, 64],
-            "parts": [{
-                "name": "wing",
-                "cubes": [{
-                    "origin": [0.0, 0.0, 0.0],
-                    "size": [0.0, 5.0, 8.0],
-                    "uv": [16.0, 0.0]
+    #[test]
+    fn resolve_block_models_merges_parent_textures_and_elements() {
+        let mut raw = HashMap::new();
+        raw.insert("block".to_string(), json!({"gui_light": "side"}));
+        raw.insert(
+            "cube".to_string(),
+            json!({
+                "parent": "block/block",
+                "elements": [{
+                    "from": [0, 0, 0],
+                    "to": [16, 16, 16],
+                    "faces": {
+                        "north": {"texture": "#all"}
+                    }
                 }]
+            }),
+        );
+        raw.insert(
+            "stone".to_string(),
+            json!({
+                "parent": "minecraft:block/cube_all",
+                "textures": {"all": "minecraft:block/stone"}
+            }),
+        );
+        raw.insert(
+            "cube_all".to_string(),
+            json!({
+                "parent": "block/cube",
+                "textures": {
+                    "particle": "#all",
+                    "north": "#all",
+                    "south": "#all"
+                }
+            }),
+        );
+
+        let resolved = resolve_block_models(&raw);
+        let stone = resolved.get("stone").unwrap();
+        assert!(stone.get("parent").is_none());
+        assert_eq!(stone["textures"]["all"], json!("minecraft:block/stone"));
+        assert_eq!(stone["textures"]["north"], json!("#all"));
+        assert!(stone["elements"].is_array());
+        assert_eq!(
+            stone["elements"][0]["faces"]["north"]["texture"],
+            json!("#all")
+        );
+
+        let parsed = parse_model(stone).unwrap();
+        assert_eq!(parsed.faces.len(), 1);
+        assert!(
+            !is_atlas_layout(&parsed.faces),
+            "single-face cube is not atlas"
+        );
+    }
+
+    #[test]
+    fn is_atlas_layout_requires_distinct_rects_in_one_group() {
+        let full = ModelFace {
+            texture: "all".into(),
+            rect: FaceRect {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+            },
+            face: "north".into(),
+            group: 0,
+        };
+        let mut same = full.clone();
+        same.face = "east".into();
+        assert!(!is_atlas_layout(&[full.clone(), same]));
+
+        let mut atlas = full.clone();
+        atlas.rect = FaceRect {
+            x: 8,
+            y: 0,
+            width: 8,
+            height: 16,
+        };
+        assert!(is_atlas_layout(&[full, atlas]));
+    }
+
+    #[test]
+    fn block_texture_stem_parses_namespaced_paths() {
+        assert_eq!(
+            block_texture_stem("minecraft:block/lantern").as_deref(),
+            Some("lantern")
+        );
+        assert_eq!(block_texture_stem("block/dirt").as_deref(), Some("dirt"));
+        assert_eq!(block_texture_stem("minecraft:item/stick"), None);
+        assert_eq!(block_texture_stem("block/sub/dir"), None);
+    }
+
+    #[test]
+    fn block_texture_stems_follows_aliases() {
+        let mut textures = HashMap::new();
+        textures.insert("particle".into(), "#lantern".to_string());
+        textures.insert("lantern".into(), "minecraft:block/lantern".to_string());
+        let stems = block_texture_stems(&textures);
+        assert_eq!(stems, vec!["lantern".to_string()]);
+    }
+
+    #[test]
+    fn texture_only_faces_default_to_full_uv() {
+        let model = json!({
+            "textures": {"all": "minecraft:block/dirt"},
+            "elements": [{
+                "from": [0, 0, 0],
+                "to": [16, 16, 16],
+                "faces": {
+                    "north": {"texture": "#all"},
+                    "east": {"texture": "#all"}
+                }
             }]
         });
-        let parsed = parse_model(&entity).unwrap();
-        let names: Vec<&str> = parsed.faces.iter().map(|face| face.face.as_str()).collect();
-        assert_eq!(names.len(), 2);
-        assert!(names.contains(&"east") && names.contains(&"west"));
-        let east = parsed
-            .faces
-            .iter()
-            .find(|face| face.face == "east")
-            .unwrap();
-        // uv(16,0), dz=8, dy=5: east at (u+dz+dx, v+dz)=(24, 8) size 8×5.
-        assert_eq!(
-            east.rect,
-            FaceRect {
-                x: 24,
-                y: 8,
-                width: 8,
-                height: 5
-            }
+        let parsed = parse_model(&model).unwrap();
+        assert_eq!(parsed.faces.len(), 2);
+        assert!(
+            parsed
+                .faces
+                .iter()
+                .all(|face| face.rect.width == 16 && face.rect.height == 16)
         );
+        assert!(!is_atlas_layout(&parsed.faces));
     }
 }

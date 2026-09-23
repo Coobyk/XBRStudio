@@ -286,10 +286,11 @@ impl AppView {
                         Ok(JarMessage::Progress(BatchProgress::Started {
                             total,
                             entity_models,
+                            block_models,
                         })) => {
                             this.update(cx, |view, cx| {
                                 view.status = format!(
-                                    "Upscaling 0/{total} textures ({entity_models} entity models for stitching)"
+                                    "Upscaling 0/{total} textures ({entity_models} entity, {block_models} block models)"
                                 );
                                 cx.notify();
                             })
@@ -347,8 +348,10 @@ impl AppView {
                                             }
                                             if report.stitched > 0 {
                                                 summary.push_str(&format!(
-                                                    ", {} stitched via {} models",
-                                                    report.stitched, report.entity_models
+                                                    ", {} stitched via {} entity + {} block models",
+                                                    report.stitched,
+                                                    report.entity_models,
+                                                    report.block_models
                                                 ));
                                             }
                                             if !report.unmatched_entity.is_empty() {

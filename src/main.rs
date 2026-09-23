@@ -156,8 +156,11 @@ fn run_batch(cli: &Cli, jar_path: &Path) -> Result<(), String> {
         BatchProgress::Started {
             total,
             entity_models,
+            block_models,
         } => {
-            println!("{total} textures; {entity_models} entity models loaded for stitching");
+            println!(
+                "{total} textures; {entity_models} entity models, {block_models} block models for stitching"
+            );
         }
         BatchProgress::Texture { done, total, name } => {
             if done == 1 || done == total || done % 25 == 0 {
@@ -182,8 +185,8 @@ fn run_batch(cli: &Cli, jar_path: &Path) -> Result<(), String> {
     }
     if report.stitched > 0 {
         println!(
-            "  entity textures stitched with {} models: {}",
-            report.entity_models, report.stitched
+            "  textures stitched with {} entity + {} block models: {}",
+            report.entity_models, report.block_models, report.stitched
         );
     }
     if !report.unmatched_entity.is_empty() {

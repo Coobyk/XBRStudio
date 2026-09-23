@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use image::{Rgba, RgbaImage};
+use rayon::prelude::*;
 use xbrz::scale_rgba;
 
 use crate::model::{FaceRect, ModelFace};
@@ -450,9 +451,10 @@ pub fn face_border_tile(
     Ok(build_padded_tile(source, face, &group, border))
 }
 
-/// Empty canvas; each face is pasted as its own neighbor-bordered tile
-/// (upscaled, border cropped) at `rect × factor`. Uncovered atlas pixels
-/// stay transparent — no plain-xBRZ base under the faces.
+/// Plain-xBRZ base; each face is pasted as its own neighbor-bordered tile
+/// (upscaled, border cropped) at `rect × factor`. Texture outside the model's
+/// UV rects keeps the plain upscale so partial-UV models (lantern) don't
+/// punch holes in unreferenced atlas content.
 fn upscale_box_faces(
     image: &RgbaImage,
     faces: &[ModelFace],
@@ -461,31 +463,50 @@ fn upscale_box_faces(
     let (source_width, source_height) = (image.width(), image.height());
     let (output_width, output_height) = (source_width * factor, source_height * factor);
 
-    let mut output = RgbaImage::from_pixel(output_width, output_height, Rgba([0, 0, 0, 0]));
+    let mut output = upscale_image(
+        image,
+        None,
+        &UpscaleConfig {
+            factor,
+            stitch_faces: false,
+        },
+    )?;
 
     let mut boxes: HashMap<u32, Vec<usize>> = HashMap::new();
     for (index, face) in faces.iter().enumerate() {
         boxes.entry(face.group).or_default().push(index);
     }
 
-    for indices in boxes.values() {
+    let mut group_maps: HashMap<u32, HashMap<&str, &ModelFace>> = HashMap::new();
+    for (&group_id, indices) in &boxes {
         let mut group: HashMap<&str, &ModelFace> = HashMap::new();
         for &index in indices {
             let face = &faces[index];
             group.entry(face.face.as_str()).or_insert(face);
         }
+        group_maps.insert(group_id, group);
+    }
 
-        for &index in indices {
+    let work: Vec<usize> = faces
+        .iter()
+        .enumerate()
+        .filter(|(_, face)| {
+            face.rect.width > 0
+                && face.rect.height > 0
+                && face.rect.x < source_width
+                && face.rect.y < source_height
+        })
+        .map(|(index, _)| index)
+        .collect();
+
+    let upscaled_faces: Result<Vec<(usize, RgbaImage)>, String> = work
+        .into_par_iter()
+        .map(|index| {
             let face = &faces[index];
-            if face.rect.width == 0
-                || face.rect.height == 0
-                || face.rect.x >= source_width
-                || face.rect.y >= source_height
-            {
-                continue;
-            }
-
-            let padded = build_padded_tile(image, face, &group, 1);
+            let group = group_maps
+                .get(&face.group)
+                .ok_or_else(|| "missing face group".to_string())?;
+            let padded = build_padded_tile(image, face, group, 1);
             let upscaled = upscale_image(
                 &padded,
                 None,
@@ -502,19 +523,25 @@ fn upscale_box_faces(
                 face.rect.height * factor,
             )
             .to_image();
+            Ok((index, cropped))
+        })
+        .collect();
 
-            for y in 0..cropped.height() {
-                let output_y = face.rect.y * factor + y;
-                if output_y >= output_height {
+    let mut upscaled_faces = upscaled_faces?;
+    upscaled_faces.sort_by_key(|(index, _)| *index);
+    for (index, cropped) in upscaled_faces {
+        let face = &faces[index];
+        for y in 0..cropped.height() {
+            let output_y = face.rect.y * factor + y;
+            if output_y >= output_height {
+                break;
+            }
+            for x in 0..cropped.width() {
+                let output_x = face.rect.x * factor + x;
+                if output_x >= output_width {
                     break;
                 }
-                for x in 0..cropped.width() {
-                    let output_x = face.rect.x * factor + x;
-                    if output_x >= output_width {
-                        break;
-                    }
-                    output.put_pixel(output_x, output_y, *cropped.get_pixel(x, y));
-                }
+                output.put_pixel(output_x, output_y, *cropped.get_pixel(x, y));
             }
         }
     }
@@ -811,13 +838,14 @@ mod tests {
         second.group = 1;
         assert_eq!(box_count(&[face(0, 0, 2, 2), second]), 2);
 
-        // Faces paste onto an empty canvas: a pixel outside every face rect
-        // must stay transparent (no plain-xBRZ base underneath).
-        // west is (0,2,2×2) → dest (0,8)-(8,16); (0,0) is outside all faces.
+        // Non-face pixels keep the plain-xBRZ base (partial-UV models like the
+        // lantern must not punch holes in unreferenced atlas content).
+        // west is (0,2,2×2) → dest (0,8)-(8,16); (0,0) is outside all faces
+        // but the source pixel there is opaque, so the base remains opaque.
         assert_eq!(
             stitched.get_pixel(0, 0).0[3],
-            0,
-            "non-face pixel stays empty"
+            255,
+            "non-face pixel keeps plain-xBRZ base"
         );
     }
 
