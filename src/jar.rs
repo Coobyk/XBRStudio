@@ -333,7 +333,7 @@ fn process_one(
         let mut local_model: Option<ModelFaces> = None;
         if opts.stitch {
             if let Some(ctx) = texture_ctx(relative) {
-                if let Some(model) = best_model_for(models, &ctx) {
+                if let Some(model) = best_model_for(models, &ctx, (image.width(), image.height())) {
                     let original_faces = model.faces.faces.len();
                     let mut model_faces = model.faces.clone();
                     if !model.has_texture_size {
@@ -563,13 +563,15 @@ fn texture_ctx(relative_path: &str) -> Option<TextureCtx> {
         return None;
     }
     let is_equipment = family == "equipment";
-    let (stripped, wants_baby, wants_cold, wants_warm) = strip_variant_tokens(&stem);
+    // `entity/zombie_villager/baby/plains.png` — age lives in the path, not the stem.
+    let path_baby = rest.split('/').any(|segment| segment == "baby");
+    let (stripped, stem_baby, wants_cold, wants_warm) = strip_variant_tokens(&stem);
     Some(TextureCtx {
         family,
         subdir,
         stem,
         stripped,
-        wants_baby,
+        wants_baby: stem_baby || path_baby,
         wants_cold,
         wants_warm,
         is_equipment,
@@ -705,7 +707,7 @@ fn signal_score(model: &EntityModel, ctx: &TextureCtx) -> i64 {
     }
 
     if ctx.wants_baby && model_baby {
-        signal += 600;
+        signal += 800;
     } else if ctx.wants_baby && model_adult {
         signal -= 400;
     } else if !ctx.wants_baby && model_baby {
@@ -742,20 +744,33 @@ fn signal_score(model: &EntityModel, ctx: &TextureCtx) -> i64 {
     signal
 }
 
-fn score_model(model: &EntityModel, ctx: &TextureCtx) -> i64 {
+fn score_model(model: &EntityModel, ctx: &TextureCtx, image: (u32, u32)) -> i64 {
     if signal_score(model, ctx) < MIN_SIGNAL {
         return i64::MIN / 4; // ineligible, but comparable for max()
     }
-    signal_score(model, ctx)
+    let mut score = signal_score(model, ctx)
         + model.faces.faces.len() as i64
-        + if model.has_texture_size { 300 } else { 0 }
+        + if model.has_texture_size { 300 } else { 0 };
+    // Prefer a model whose declared texture_size matches the image so a 32×32
+    // baby pig is not stitched with the 64×64 adult UV layout (and vice versa).
+    if model.has_texture_size && image != (0, 0) {
+        let (uv_w, uv_h) = model.faces.uv_size;
+        if uv_w as u32 == image.0 && uv_h as u32 == image.1 {
+            score += 2000;
+        }
+    }
+    score
 }
 
-fn best_model_for<'a>(models: &'a [EntityModel], ctx: &TextureCtx) -> Option<&'a EntityModel> {
+fn best_model_for<'a>(
+    models: &'a [EntityModel],
+    ctx: &TextureCtx,
+    image: (u32, u32),
+) -> Option<&'a EntityModel> {
     models
         .iter()
         .filter(|model| signal_score(model, ctx) >= MIN_SIGNAL)
-        .max_by_key(|model| score_model(model, ctx))
+        .max_by_key(|model| score_model(model, ctx, image))
 }
 
 fn load_entity_models(model_dir: &Path) -> Vec<EntityModel> {
@@ -972,6 +987,103 @@ mod tests {
                 .subdir,
             ""
         );
+        assert!(
+            texture_ctx("entity/zombie_villager/baby/plains.png")
+                .unwrap()
+                .wants_baby
+        );
+        assert!(
+            !texture_ctx("entity/zombie_villager/type/plains.png")
+                .unwrap()
+                .wants_baby
+        );
+    }
+
+    fn texture_sized_model(
+        key: &str,
+        method: &str,
+        pkg: &[&str],
+        face_count: usize,
+        uv: (f32, f32),
+    ) -> EntityModel {
+        let mut model = test_model(key, method, pkg, face_count);
+        model.faces.uv_size = uv;
+        model
+    }
+
+    #[test]
+    fn baby_pig_texture_size_picks_babypig_over_adult() {
+        let models = vec![
+            texture_sized_model(
+                "babypig",
+                "createbodylayer",
+                &["net", "m", "model", "animal", "pig"],
+                42,
+                (32.0, 32.0),
+            ),
+            texture_sized_model(
+                "pig",
+                "createbasepigmodel",
+                &["net", "m", "model", "animal", "pig"],
+                42,
+                (64.0, 64.0),
+            ),
+            texture_sized_model(
+                "coldpig",
+                "createbodylayer",
+                &["net", "m", "model", "animal", "pig"],
+                48,
+                (64.0, 64.0),
+            ),
+        ];
+        assert_eq!(
+            pick_sized(&models, "entity/pig/pig_temperate_baby.png", (32, 32))
+                .map(|m| m.key.as_str()),
+            Some("babypig")
+        );
+        assert_eq!(
+            pick_sized(&models, "entity/pig/pig_cold_baby.png", (32, 32)).map(|m| m.key.as_str()),
+            Some("babypig")
+        );
+        assert_eq!(
+            pick_sized(&models, "entity/pig/pig_cold.png", (64, 64)).map(|m| m.key.as_str()),
+            Some("coldpig")
+        );
+        assert_eq!(
+            pick_sized(&models, "entity/pig/pig_temperate.png", (64, 64)).map(|m| m.key.as_str()),
+            Some("pig")
+        );
+    }
+
+    #[test]
+    fn path_segment_baby_prefers_baby_zombie_villager() {
+        let models = vec![
+            test_model(
+                "zombievillager",
+                "createbodylayer",
+                &["net", "m", "model", "monster", "zombie"],
+                48,
+            ),
+            test_model(
+                "babyzombievillager",
+                "createbodylayer",
+                &["net", "m", "model", "monster", "zombie"],
+                60,
+            ),
+        ];
+        assert_eq!(
+            pick(&models, "entity/zombie_villager/baby/plains.png").map(|m| m.key.as_str()),
+            Some("babyzombievillager")
+        );
+        assert_eq!(
+            pick(&models, "entity/zombie_villager/type/plains.png").map(|m| m.key.as_str()),
+            Some("zombievillager")
+        );
+        assert_eq!(
+            pick(&models, "entity/zombie_villager/zombie_villager_baby.png")
+                .map(|m| m.key.as_str()),
+            Some("babyzombievillager")
+        );
     }
 
     fn test_model(key: &str, method: &str, pkg: &[&str], face_count: usize) -> EntityModel {
@@ -1004,8 +1116,16 @@ mod tests {
     }
 
     fn pick<'a>(models: &'a [EntityModel], path: &str) -> Option<&'a EntityModel> {
+        pick_sized(models, path, (0, 0))
+    }
+
+    fn pick_sized<'a>(
+        models: &'a [EntityModel],
+        path: &str,
+        image: (u32, u32),
+    ) -> Option<&'a EntityModel> {
         let ctx = texture_ctx(path)?;
-        best_model_for(models, &ctx)
+        best_model_for(models, &ctx, image)
     }
 
     fn wolf_models() -> Vec<EntityModel> {
