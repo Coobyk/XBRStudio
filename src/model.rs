@@ -227,9 +227,7 @@ fn extract_textures(root: &Value) -> HashMap<String, String> {
         .map(|map| {
             map.iter()
                 .filter_map(|(key, value)| {
-                    value
-                        .as_str()
-                        .map(|value| (key.clone(), value.to_string()))
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
                 })
                 .collect()
         })
@@ -297,10 +295,34 @@ mod tests {
         assert_eq!(parsed.faces.len(), 2);
         assert_eq!(parsed.uv_size, (16.0, 16.0));
         assert_eq!(parsed.textures.get("all").unwrap(), "minecraft:block/stone");
-        let north = parsed.faces.iter().find(|face| face.face == "north").unwrap();
-        let east = parsed.faces.iter().find(|face| face.face == "east").unwrap();
-        assert_eq!(north.rect, FaceRect { x: 0, y: 0, width: 16, height: 8 });
-        assert_eq!(east.rect, FaceRect { x: 16, y: 0, width: 8, height: 8 });
+        let north = parsed
+            .faces
+            .iter()
+            .find(|face| face.face == "north")
+            .unwrap();
+        let east = parsed
+            .faces
+            .iter()
+            .find(|face| face.face == "east")
+            .unwrap();
+        assert_eq!(
+            north.rect,
+            FaceRect {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 8
+            }
+        );
+        assert_eq!(
+            east.rect,
+            FaceRect {
+                x: 16,
+                y: 0,
+                width: 8,
+                height: 8
+            }
+        );
     }
 
     #[test]
@@ -334,12 +356,60 @@ mod tests {
                 .rect
         };
         // dx=8, dy=8, dz=6
-        assert_eq!(find("down"), FaceRect { x: 6, y: 0, width: 8, height: 6 });
-        assert_eq!(find("up"), FaceRect { x: 14, y: 0, width: 8, height: 6 });
-        assert_eq!(find("east"), FaceRect { x: 14, y: 6, width: 6, height: 8 });
-        assert_eq!(find("north"), FaceRect { x: 6, y: 6, width: 8, height: 8 });
-        assert_eq!(find("west"), FaceRect { x: 0, y: 6, width: 6, height: 8 });
-        assert_eq!(find("south"), FaceRect { x: 20, y: 6, width: 8, height: 8 });
+        assert_eq!(
+            find("down"),
+            FaceRect {
+                x: 6,
+                y: 0,
+                width: 8,
+                height: 6
+            }
+        );
+        assert_eq!(
+            find("up"),
+            FaceRect {
+                x: 14,
+                y: 0,
+                width: 8,
+                height: 6
+            }
+        );
+        assert_eq!(
+            find("east"),
+            FaceRect {
+                x: 14,
+                y: 6,
+                width: 6,
+                height: 8
+            }
+        );
+        assert_eq!(
+            find("north"),
+            FaceRect {
+                x: 6,
+                y: 6,
+                width: 8,
+                height: 8
+            }
+        );
+        assert_eq!(
+            find("west"),
+            FaceRect {
+                x: 0,
+                y: 6,
+                width: 6,
+                height: 8
+            }
+        );
+        assert_eq!(
+            find("south"),
+            FaceRect {
+                x: 20,
+                y: 6,
+                width: 8,
+                height: 8
+            }
+        );
     }
 
     #[test]
@@ -442,11 +512,16 @@ mod tests {
         let groups: std::collections::HashSet<u32> =
             parsed.faces.iter().map(|face| face.group).collect();
         assert_eq!(groups, [0, 1].into_iter().collect());
-        assert!(parsed
-            .faces
-            .iter()
-            .filter(|face| face.group == 0)
-            .all(|face| matches!(face.face.as_str(), "down" | "up" | "east" | "north" | "west" | "south")));
+        assert!(
+            parsed
+                .faces
+                .iter()
+                .filter(|face| face.group == 0)
+                .all(|face| matches!(
+                    face.face.as_str(),
+                    "down" | "up" | "east" | "north" | "west" | "south"
+                ))
+        );
 
         let block = json!({
             "elements": [
@@ -492,11 +567,21 @@ mod tests {
         // up at (u+dz+dx, v)=(28,13) size 4×7.
         assert_eq!(
             down.rect,
-            FaceRect { x: 24, y: 13, width: 4, height: 7 }
+            FaceRect {
+                x: 24,
+                y: 13,
+                width: 4,
+                height: 7
+            }
         );
         assert_eq!(
             up.rect,
-            FaceRect { x: 28, y: 13, width: 4, height: 7 }
+            FaceRect {
+                x: 28,
+                y: 13,
+                width: 4,
+                height: 7
+            }
         );
         assert_eq!(down.group, up.group);
 
@@ -524,7 +609,12 @@ mod tests {
         // uv(16,0), dz=8, dy=5: east at (u+dz+dx, v+dz)=(24, 8) size 8×5.
         assert_eq!(
             east.rect,
-            FaceRect { x: 24, y: 8, width: 8, height: 5 }
+            FaceRect {
+                x: 24,
+                y: 8,
+                width: 8,
+                height: 5
+            }
         );
     }
 }

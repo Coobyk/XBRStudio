@@ -78,7 +78,11 @@ fn run(cli: Cli) -> Result<(), String> {
     }
 
     let output = cli.output.clone().unwrap_or_else(|| {
-        let stem = cli.texture.file_stem().unwrap_or_default().to_string_lossy();
+        let stem = cli
+            .texture
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy();
         cli.texture.with_file_name(format!("{stem}_slices"))
     });
     std::fs::create_dir_all(&output)
@@ -190,7 +194,10 @@ mod tests {
             width: 8,
             height: 8,
         };
-        let name = format!("g0_north_{}x{}_{}x{}", rect.x, rect.y, rect.width, rect.height);
+        let name = format!(
+            "g0_north_{}x{}_{}x{}",
+            rect.x, rect.y, rect.width, rect.height
+        );
         assert_eq!(name, "g0_north_6x6_8x8");
     }
 }

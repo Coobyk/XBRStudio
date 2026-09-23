@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use image::{RgbaImage, imageops};
 
-use xbrstudio::model::{load_model, scale_model_faces_to_image, ModelFace};
+use xbrstudio::model::{ModelFace, load_model, scale_model_faces_to_image};
 
 const SHADE_FULL: u32 = 0xFF;
 const SHADE_DIM: u32 = 0x88;
@@ -98,7 +98,8 @@ fn overlay_faces(image: &RgbaImage, faces: &[ModelFace]) -> RgbaImage {
                 for channel in 0..3 {
                     let base = pixel.0[channel] as f32;
                     let fill = color[channel] as f32;
-                    pixel.0[channel] = (base * (1.0 - BLEND_FILL) + fill * BLEND_FILL).round() as u8;
+                    pixel.0[channel] =
+                        (base * (1.0 - BLEND_FILL) + fill * BLEND_FILL).round() as u8;
                 }
             }
         }
@@ -145,7 +146,11 @@ fn run(cli: Cli) -> Result<(), String> {
     }
 
     let output = cli.output.clone().unwrap_or_else(|| {
-        let stem = cli.texture.file_stem().unwrap_or_default().to_string_lossy();
+        let stem = cli
+            .texture
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy();
         cli.texture.with_file_name(format!("{stem}_faces.png"))
     });
     if let Some(parent) = output.parent() {
