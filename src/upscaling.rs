@@ -182,6 +182,8 @@ fn sample_edge(
     sample_clamped(image, x as i64, y as i64)
 }
 
+/// 3D-adjacent face sample for this edge, or `None` when the neighbor face is
+/// absent (flat cubes: axolotl tail/legs/gills) — those borders stay empty.
 fn neighbor_or_wrap(
     source: &RgbaImage,
     face: &ModelFace,
@@ -190,48 +192,18 @@ fn neighbor_or_wrap(
     i: i32,
     len: usize,
     depth: u32,
-) -> Rgba<u8> {
-    if let Some((name, n_edge, rev)) = neighbor_edge(&face.face, edge) {
-        if let Some(neighbor) = group.get(name) {
-            return sample_edge(source, &neighbor.rect, n_edge, rev, i, len, depth);
-        }
-    }
-    // No neighbor face: use the atlas pixels just outside this edge (the same
-    // context whole-image xBRZ sees). Self-wrapping the opposite edge invents
-    // seams on sparse flat-cube faces (axolotl gills/legs).
-    sample_atlas_outside(source, &face.rect, edge, i, len, depth)
-}
-
-/// Sample `depth` steps outward from `rect`'s `edge` (0 = the adjacent atlas
-/// pixel outside the face), parameterized along the edge like `sample_edge`.
-fn sample_atlas_outside(
-    source: &RgbaImage,
-    rect: &FaceRect,
-    edge: Edge,
-    i: i32,
-    len: usize,
-    depth: u32,
-) -> Rgba<u8> {
-    let len = len.max(1);
-    let i = i.clamp(0, len as i32 - 1) as usize;
-    let p = if len <= 1 {
-        0
-    } else {
-        i * (match edge {
-            Edge::Top | Edge::Bottom => rect.width,
-            Edge::Left | Edge::Right => rect.height,
-        }
-        .max(1) as usize
-            - 1)
-            / (len - 1)
-    };
-    let (x, y) = match edge {
-        Edge::Top => (rect.x + p as u32, rect.y.saturating_sub(1 + depth)),
-        Edge::Bottom => (rect.x + p as u32, rect.bottom() + depth),
-        Edge::Left => (rect.x.saturating_sub(1 + depth), rect.y + p as u32),
-        Edge::Right => (rect.right() + depth, rect.y + p as u32),
-    };
-    sample_clamped(source, x as i64, y as i64)
+) -> Option<Rgba<u8>> {
+    let (name, n_edge, rev) = neighbor_edge(&face.face, edge)?;
+    let neighbor = group.get(name)?;
+    Some(sample_edge(
+        source,
+        &neighbor.rect,
+        n_edge,
+        rev,
+        i,
+        len,
+        depth,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -242,10 +214,8 @@ enum Corner {
     BottomRight,
 }
 
-/// Corner pixel at along-edge index `i` (may sit outside the face; clamped)
-/// and `depth` steps into the neighbor from the shared edge. Prefers the
-/// neighbor across the horizontal edge (top/bottom), then the vertical-edge
-/// neighbor, then the atlas pixel diagonally outside the face.
+/// Corner sample from the neighbor across the primary edge, else the
+/// secondary-edge neighbor, else `None` (corner stays empty).
 fn corner_pixel(
     source: &RgbaImage,
     face: &ModelFace,
@@ -253,7 +223,7 @@ fn corner_pixel(
     corner: Corner,
     i: i32,
     depth: u32,
-) -> Rgba<u8> {
+) -> Option<Rgba<u8>> {
     let w = face.rect.width as usize;
     let h = face.rect.height as usize;
     let primary_edge = match corner {
@@ -262,7 +232,15 @@ fn corner_pixel(
     };
     if let Some((name, n_edge, rev)) = neighbor_edge(&face.face, primary_edge) {
         if let Some(neighbor) = group.get(name) {
-            return sample_edge(source, &neighbor.rect, n_edge, rev, i, w.max(1), depth);
+            return Some(sample_edge(
+                source,
+                &neighbor.rect,
+                n_edge,
+                rev,
+                i,
+                w.max(1),
+                depth,
+            ));
         }
     }
     let (secondary_edge, secondary_i) = match corner {
@@ -273,7 +251,7 @@ fn corner_pixel(
     };
     if let Some((name, n_edge, rev)) = neighbor_edge(&face.face, secondary_edge) {
         if let Some(neighbor) = group.get(name) {
-            return sample_edge(
+            return Some(sample_edge(
                 source,
                 &neighbor.rect,
                 n_edge,
@@ -281,43 +259,26 @@ fn corner_pixel(
                 secondary_i,
                 h.max(1),
                 depth,
-            );
+            ));
         }
     }
-    // Neither adjacent face exists: sample diagonally outside the face so the
-    // corner matches the atlas context plain xBRZ would use.
-    let (x, y) = match corner {
-        Corner::TopLeft => (
-            face.rect.x.saturating_sub(1 + depth),
-            face.rect.y.saturating_sub(1 + depth),
-        ),
-        Corner::TopRight => (
-            face.rect.right() + depth,
-            face.rect.y.saturating_sub(1 + depth),
-        ),
-        Corner::BottomLeft => (
-            face.rect.x.saturating_sub(1 + depth),
-            face.rect.bottom() + depth,
-        ),
-        Corner::BottomRight => (face.rect.right() + depth, face.rect.bottom() + depth),
-    };
-    sample_clamped(source, x as i64, y as i64)
+    None
 }
 
-    /// (w+2·border)×(h+2·border) tile: interior = face's own atlas pixels, the
-    /// border ring = each 3D-adjacent face sampled from the shared edge inward
-    /// (`depth` walks into that neighbor), or the atlas pixels just outside
-    /// this face when the neighbor is absent.
-    ///
-    /// Border pixels never drop below the alpha of the face edge they frame:
-    /// a transparent atlas gap next to an opaque edge would otherwise bleed
-    /// holes into the face when xBRZ interpolates (frog head/tongue borders).
-    fn build_padded_tile(
-        source: &RgbaImage,
-        face: &ModelFace,
-        group: &HashMap<&str, &ModelFace>,
-        border: u32,
-    ) -> RgbaImage {
+/// (w+2·border)×(h+2·border) tile: interior = face's own atlas pixels, the
+/// border ring = each 3D-adjacent face sampled from the shared edge inward
+/// (`depth` walks into that neighbor). Missing neighbors stay transparent —
+/// no atlas-outside fill, no opposite-edge wrap.
+///
+/// When a neighbor sample is present, its alpha never drops below the face
+/// edge it frames: a transparent atlas gap next to an opaque edge would
+/// otherwise bleed holes into the face when xBRZ interpolates (frog).
+fn build_padded_tile(
+    source: &RgbaImage,
+    face: &ModelFace,
+    group: &HashMap<&str, &ModelFace>,
+    border: u32,
+) -> RgbaImage {
         let (w, h) = (face.rect.width, face.rect.height);
         let b = border.max(1);
         let mut tile = RgbaImage::new(w + 2 * b, h + 2 * b);
@@ -338,20 +299,41 @@ fn corner_pixel(
         for i in 0..w_i {
             for depth in 0..b {
                 let top_y = b - 1 - depth;
-                let edge_px = sample_edge(source, &face.rect, Edge::Top, false, i, w as usize, 0);
-                let pixel = floor_border_alpha(
-                    neighbor_or_wrap(source, face, group, Edge::Top, i, w as usize, depth),
-                    edge_px,
-                );
+                let pixel = match neighbor_or_wrap(source, face, group, Edge::Top, i, w as usize, depth)
+                {
+                    Some(sample) => {
+                        let edge_px =
+                            sample_edge(source, &face.rect, Edge::Top, false, i, w as usize, 0);
+                        floor_border_alpha(sample, edge_px)
+                    }
+                    None => Rgba([0, 0, 0, 0]),
+                };
                 tile.put_pixel((b_i + i) as u32, top_y, pixel);
 
                 let bottom_y = b + h + depth;
-                let edge_px =
-                    sample_edge(source, &face.rect, Edge::Bottom, false, i, w as usize, 0);
-                let pixel = floor_border_alpha(
-                    neighbor_or_wrap(source, face, group, Edge::Bottom, i, w as usize, depth),
-                    edge_px,
-                );
+                let pixel = match neighbor_or_wrap(
+                    source,
+                    face,
+                    group,
+                    Edge::Bottom,
+                    i,
+                    w as usize,
+                    depth,
+                ) {
+                    Some(sample) => {
+                        let edge_px = sample_edge(
+                            source,
+                            &face.rect,
+                            Edge::Bottom,
+                            false,
+                            i,
+                            w as usize,
+                            0,
+                        );
+                        floor_border_alpha(sample, edge_px)
+                    }
+                    None => Rgba([0, 0, 0, 0]),
+                };
                 tile.put_pixel((b_i + i) as u32, bottom_y, pixel);
             }
         }
@@ -359,19 +341,36 @@ fn corner_pixel(
         for i in 0..h_i {
             for depth in 0..b {
                 let left_x = b - 1 - depth;
-                let edge_px = sample_edge(source, &face.rect, Edge::Left, false, i, h as usize, 0);
-                let pixel = floor_border_alpha(
-                    neighbor_or_wrap(source, face, group, Edge::Left, i, h as usize, depth),
-                    edge_px,
-                );
+                let pixel =
+                    match neighbor_or_wrap(source, face, group, Edge::Left, i, h as usize, depth)
+                    {
+                        Some(sample) => {
+                            let edge_px =
+                                sample_edge(source, &face.rect, Edge::Left, false, i, h as usize, 0);
+                            floor_border_alpha(sample, edge_px)
+                        }
+                        None => Rgba([0, 0, 0, 0]),
+                    };
                 tile.put_pixel(left_x, (b_i + i) as u32, pixel);
 
                 let right_x = b + w + depth;
-                let edge_px = sample_edge(source, &face.rect, Edge::Right, false, i, h as usize, 0);
-                let pixel = floor_border_alpha(
-                    neighbor_or_wrap(source, face, group, Edge::Right, i, h as usize, depth),
-                    edge_px,
-                );
+                let pixel =
+                    match neighbor_or_wrap(source, face, group, Edge::Right, i, h as usize, depth)
+                    {
+                        Some(sample) => {
+                            let edge_px = sample_edge(
+                                source,
+                                &face.rect,
+                                Edge::Right,
+                                false,
+                                i,
+                                h as usize,
+                                0,
+                            );
+                            floor_border_alpha(sample, edge_px)
+                        }
+                        None => Rgba([0, 0, 0, 0]),
+                    };
                 tile.put_pixel(right_x, (b_i + i) as u32, pixel);
             }
         }
@@ -383,38 +382,47 @@ fn corner_pixel(
 
                 // Top-left: primary along-index extends left of the face (≤ 0).
                 let i = cx_i - b_i;
-                let edge_px = corner_face_edge(source, face, Corner::TopLeft, i);
-                let pixel = floor_border_alpha(
-                    corner_pixel(source, face, group, Corner::TopLeft, i, depth_y),
-                    edge_px,
-                );
+                let pixel = match corner_pixel(source, face, group, Corner::TopLeft, i, depth_y) {
+                    Some(sample) => {
+                        let edge_px = corner_face_edge(source, face, Corner::TopLeft, i);
+                        floor_border_alpha(sample, edge_px)
+                    }
+                    None => Rgba([0, 0, 0, 0]),
+                };
                 tile.put_pixel(cx, cy, pixel);
 
                 // Top-right: along-index extends right of the face (≥ w).
                 let i = w_i + cx_i;
-                let edge_px = corner_face_edge(source, face, Corner::TopRight, i);
-                let pixel = floor_border_alpha(
-                    corner_pixel(source, face, group, Corner::TopRight, i, depth_y),
-                    edge_px,
-                );
+                let pixel = match corner_pixel(source, face, group, Corner::TopRight, i, depth_y) {
+                    Some(sample) => {
+                        let edge_px = corner_face_edge(source, face, Corner::TopRight, i);
+                        floor_border_alpha(sample, edge_px)
+                    }
+                    None => Rgba([0, 0, 0, 0]),
+                };
                 tile.put_pixel(b + w + cx, cy, pixel);
 
                 // Bottom corners: depth grows downward from the interior.
                 let depth = cy;
                 let i = cx_i - b_i;
-                let edge_px = corner_face_edge(source, face, Corner::BottomLeft, i);
-                let pixel = floor_border_alpha(
-                    corner_pixel(source, face, group, Corner::BottomLeft, i, depth),
-                    edge_px,
-                );
+                let pixel = match corner_pixel(source, face, group, Corner::BottomLeft, i, depth) {
+                    Some(sample) => {
+                        let edge_px = corner_face_edge(source, face, Corner::BottomLeft, i);
+                        floor_border_alpha(sample, edge_px)
+                    }
+                    None => Rgba([0, 0, 0, 0]),
+                };
                 tile.put_pixel(cx, b + h + cy, pixel);
 
                 let i = w_i + cx_i;
-                let edge_px = corner_face_edge(source, face, Corner::BottomRight, i);
-                let pixel = floor_border_alpha(
-                    corner_pixel(source, face, group, Corner::BottomRight, i, depth),
-                    edge_px,
-                );
+                let pixel =
+                    match corner_pixel(source, face, group, Corner::BottomRight, i, depth) {
+                        Some(sample) => {
+                            let edge_px = corner_face_edge(source, face, Corner::BottomRight, i);
+                            floor_border_alpha(sample, edge_px)
+                        }
+                        None => Rgba([0, 0, 0, 0]),
+                    };
                 tile.put_pixel(b + w + cx, b + h + cy, pixel);
             }
         }
@@ -422,9 +430,10 @@ fn corner_pixel(
         tile
     }
 
-    /// Clamp a border sample so its alpha is at least the face-edge alpha it
-    /// frames. When the sample is fully transparent (atlas gap), reuse the
-    /// face-edge color too so xBRZ does not interpolate toward black.
+    /// Clamp a neighbor border sample so its alpha is at least the face-edge
+    /// alpha it frames. Fully transparent neighbor gaps reuse the edge color
+    /// so xBRZ does not interpolate toward black. Missing neighbors are never
+    /// passed through here — they stay empty.
     fn floor_border_alpha(sample: Rgba<u8>, edge: Rgba<u8>) -> Rgba<u8> {
         if sample.0[3] >= edge.0[3] {
             return sample;
@@ -453,7 +462,7 @@ fn corner_pixel(
 
     /// Neighbor-bordered cutout of `faces[index]`: interior is the face's atlas
     /// rect, surrounded by a `border`-pixel ring taken from the 3D-adjacent faces
-    /// in the same cube (atlas pixels outside the face when a neighbor is missing).
+    /// in the same cube (transparent when a neighbor is missing).
 pub fn face_border_tile(
     source: &RgbaImage,
     faces: &[ModelFace],
@@ -706,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn lone_face_uses_atlas_outside_own_edges() {
+    fn lone_face_missing_neighbors_stay_empty() {
         let (image, faces) = box_fixture();
         let north = faces
             .iter()
@@ -714,27 +723,31 @@ mod tests {
             .unwrap()
             .clone();
         let group: HashMap<&str, &ModelFace> = [("north", &north)].into_iter().collect();
-        // north.Top samples the atlas row above the face (y = rect.y - 1).
         let tile = build_padded_tile(&image, &north, &group, 1);
-        let above_y = north.rect.y.saturating_sub(1);
+        // Top/bottom strips have no 3D neighbor in this sparse group.
         for i in 0..north.rect.width {
-            let expected = *image.get_pixel(north.rect.x + i, above_y);
             assert_eq!(
-                *tile.get_pixel(i + 1, 0),
-                expected,
-                "top border i={i} should be atlas above face"
+                tile.get_pixel(i + 1, 0).0[3],
+                0,
+                "top border i={i} stays empty"
+            );
+            assert_eq!(
+                tile.get_pixel(i + 1, tile.height() - 1).0[3],
+                0,
+                "bottom border i={i} stays empty"
             );
         }
-        // north.Bottom samples the atlas row below the face.
-        let below_y = north.rect.bottom();
-        for i in 0..north.rect.width {
-            let expected = *image.get_pixel(north.rect.x + i, below_y.min(image.height() - 1));
+        // Left/right strips likewise have no neighbor.
+        for i in 0..north.rect.height {
+            assert_eq!(tile.get_pixel(0, i + 1).0[3], 0, "left border i={i}");
             assert_eq!(
-                *tile.get_pixel(i + 1, tile.height() - 1),
-                expected,
-                "bottom border i={i} should be atlas below face"
+                tile.get_pixel(tile.width() - 1, i + 1).0[3],
+                0,
+                "right border i={i}"
             );
         }
+        // Interior still samples the face itself.
+        assert_eq!(tile.get_pixel(1, 1).0[3], image.get_pixel(north.rect.x, north.rect.y).0[3]);
     }
 
     #[test]
@@ -848,7 +861,8 @@ mod tests {
                 image.put_pixel(x, y, Rgba([0, 0, 0, 0]));
             }
         }
-        // west = opaque column strip, east = transparent neighbor in same cube.
+        // west = opaque column strip; north is west.Right's 3D neighbor and
+        // is transparent in the atlas (frog-style gap next to an opaque edge).
         let west = ModelFace {
             texture: String::new(),
             rect: FaceRect {
@@ -860,7 +874,7 @@ mod tests {
             face: "west".into(),
             group: 0,
         };
-        let east = ModelFace {
+        let north = ModelFace {
             texture: String::new(),
             rect: FaceRect {
                 x: 2,
@@ -868,31 +882,31 @@ mod tests {
                 width: 2,
                 height: 4,
             },
-            face: "east".into(),
+            face: "north".into(),
             group: 0,
         };
         let group: HashMap<&str, &ModelFace> =
-            [("west", &west), ("east", &east)].into_iter().collect();
+            [("west", &west), ("north", &north)].into_iter().collect();
         let tile = build_padded_tile(&image, &west, &group, 1);
         // Right border column (x = 1 + 2 = 3) sits against the transparent
-        // east face; every sample there must stay fully opaque (west.Right
-        // edge pixels are opaque).
-        for y in 0..tile.height() {
+        // north face; edge samples there must stay fully opaque (west.Right
+        // edge pixels are opaque). Corners (y=0 / y=height-1) have no
+        // up/down neighbor in this sparse group and stay empty.
+        for y in 1..tile.height() - 1 {
             let a = tile.get_pixel(tile.width() - 1, y).0[3];
             assert_eq!(a, 255, "right border y={y} alpha={a}");
         }
     }
 
     #[test]
-    fn missing_neighbor_border_uses_atlas_outside_not_opposite_edge() {
-        // Sparse face: opposite edge is transparent, atlas above is opaque
-        // pink (axolotl gill). Missing top neighbor must sample outside, not
-        // wrap the bottom edge.
+    fn missing_neighbor_border_stays_empty_not_atlas_outside() {
+        // Sparse face: top neighbor absent. The atlas row above is opaque
+        // pink, but the border ring must stay transparent (no atlas-outside
+        // fill, no opposite-edge wrap).
         let mut image = RgbaImage::new(6, 6);
         for x in 0..6 {
             image.put_pixel(x, 1, Rgba([220, 80, 140, 255])); // atlas row above face
         }
-        // Face at (1,2) 4×2 — interior transparent except one opaque pixel.
         image.put_pixel(2, 3, Rgba([220, 80, 140, 255]));
         let north = ModelFace {
             texture: String::new(),
@@ -907,23 +921,17 @@ mod tests {
         };
         let group: HashMap<&str, &ModelFace> = [("north", &north)].into_iter().collect();
         let tile = build_padded_tile(&image, &north, &group, 1);
-        // Top border (y=0) must be the atlas row above (opaque pink).
+        // Top border must stay empty even though the atlas row above is pink.
         for x in 0..4 {
-            let px = tile.get_pixel(x + 1, 0);
-            assert_eq!(px.0[3], 255, "top border x={x} should use atlas outside");
-            assert_eq!(px.0[..3], [220, 80, 140], "top border color");
+            assert_eq!(tile.get_pixel(x + 1, 0).0[3], 0, "top border x={x} empty");
         }
-        // Bottom border under transparent face-edge columns keeps atlas below
-        // (row 4 is transparent). Column under the opaque face pixel is
-        // floored opaque by floor_border_alpha (must not punch a hole).
+        // Bottom border likewise has no neighbor — empty, not floored opaque.
         for x in 0..4 {
-            let face_edge_opaque = x == 1; // face pixel (2,3) maps to border i=1
-            let a = tile.get_pixel(x + 1, tile.height() - 1).0[3];
-            if face_edge_opaque {
-                assert_eq!(a, 255, "bottom border under opaque edge stays opaque");
-            } else {
-                assert_eq!(a, 0, "bottom border x={x} uses transparent atlas below");
-            }
+            assert_eq!(
+                tile.get_pixel(x + 1, tile.height() - 1).0[3],
+                0,
+                "bottom border x={x} empty"
+            );
         }
     }
 
