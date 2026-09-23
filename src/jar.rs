@@ -16,6 +16,8 @@ pub const TEXTURE_ROOT: &str = "assets/minecraft/textures/";
 pub struct BatchReport {
     pub total: usize,
     pub upscaled: usize,
+    /// Biome colormaps: written byte-for-byte, never upscaled.
+    pub copied: usize,
     pub stitched: usize,
     pub animated: usize,
     pub wrapped: usize,
@@ -89,8 +91,8 @@ pub fn is_wrap_texture_path(path: &Path) -> bool {
         .is_some_and(|name| name == "beacon_beam.png")
 }
 
-/// Grass/foliage colormaps (`textures/colormap/**`) — biome lookup tables,
-/// not something to upscale.
+/// Grass/foliage colormaps (`textures/colormap/**`) — biome lookup tables that
+/// must ship byte-for-byte, never upscaled.
 pub fn is_colormap_texture_path(path: &str) -> bool {
     path.starts_with("colormap/") || path.contains("/textures/colormap/")
 }
@@ -112,6 +114,7 @@ struct ProcessOutcome {
     animated: bool,
     stitched: bool,
     wrapped: bool,
+    copied: bool,
 }
 
 pub fn default_model_dir() -> Option<PathBuf> {
@@ -151,11 +154,9 @@ pub fn upscale_jar(
     }
     .validate()?;
 
-    let file = File::open(jar_path).map_err(|error| {
-        format!("cannot open {}: {error}", jar_path.display())
-    })?;
-    let mut archive =
-        ZipArchive::new(file).map_err(|error| format!("cannot read jar: {error}"))?;
+    let file = File::open(jar_path)
+        .map_err(|error| format!("cannot open {}: {error}", jar_path.display()))?;
+    let mut archive = ZipArchive::new(file).map_err(|error| format!("cannot read jar: {error}"))?;
 
     let mut index_by_name: HashMap<String, usize> = HashMap::with_capacity(archive.len());
     let mut textures: Vec<(usize, String)> = Vec::new();
@@ -167,13 +168,6 @@ pub fn upscale_jar(
             .to_string();
         index_by_name.insert(name.clone(), index);
         if name.starts_with(TEXTURE_ROOT) && name.ends_with(".png") {
-            let short = name
-                .strip_prefix(TEXTURE_ROOT)
-                .map(str::to_string)
-                .unwrap_or_else(|| name.clone());
-            if is_colormap_texture_path(&short) {
-                continue;
-            }
             textures.push((index, name));
         }
     }
@@ -207,6 +201,7 @@ pub fn upscale_jar(
     let mut report = BatchReport {
         total,
         upscaled: 0,
+        copied: 0,
         stitched: 0,
         animated: 0,
         wrapped: 0,
@@ -233,13 +228,21 @@ pub fn upscale_jar(
             &models,
         ) {
             Ok(outcome) => {
-                report.upscaled += 1;
+                if outcome.copied {
+                    report.copied += 1;
+                } else {
+                    report.upscaled += 1;
+                }
                 if outcome.animated {
                     report.animated += 1;
                 }
                 if outcome.stitched {
                     report.stitched += 1;
-                } else if opts.stitch && !outcome.animated && short.starts_with("entity/") {
+                } else if opts.stitch
+                    && !outcome.animated
+                    && !outcome.copied
+                    && short.starts_with("entity/")
+                {
                     report.unmatched_entity.push(short.to_string());
                 }
                 if outcome.wrapped {
@@ -278,7 +281,25 @@ fn process_one(
     opts: &BatchOptions,
     models: &[EntityModel],
 ) -> Result<ProcessOutcome, String> {
+    let relative = name.strip_prefix(TEXTURE_ROOT).unwrap_or(name);
     let bytes = read_entry(archive, index)?;
+
+    if is_colormap_texture_path(relative) {
+        let out_path = out_dir.join(Path::new(name));
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        }
+        std::fs::write(&out_path, &bytes)
+            .map_err(|error| format!("cannot write {}: {error}", out_path.display()))?;
+        return Ok(ProcessOutcome {
+            animated: false,
+            stitched: false,
+            wrapped: false,
+            copied: true,
+        });
+    }
+
     let image = image::load_from_memory(&bytes)
         .map_err(|error| format!("decode PNG: {error}"))?
         .to_rgba8();
@@ -297,7 +318,6 @@ fn process_one(
         .as_ref()
         .is_some_and(|value| value.get("animation").is_some_and(|item| !item.is_null()));
 
-    let relative = name.strip_prefix(TEXTURE_ROOT).unwrap_or(name);
     let wrap = opts.wrap && wants_wrap(relative);
 
     let (output, out_mcmeta, animated, stitched) = if is_animated {
@@ -306,8 +326,8 @@ fn process_one(
         let upscaled = upscale_animated(&image, animation, opts.factor, wrap)?;
         let mut scaled_value = value;
         scale_animation_fields(&mut scaled_value, opts.factor);
-        let encoded = serde_json::to_vec(&scaled_value)
-            .map_err(|error| format!("encode mcmeta: {error}"))?;
+        let encoded =
+            serde_json::to_vec(&scaled_value).map_err(|error| format!("encode mcmeta: {error}"))?;
         (upscaled, Some(encoded), true, false)
     } else {
         let mut local_model: Option<ModelFaces> = None;
@@ -317,10 +337,7 @@ fn process_one(
                     let original_faces = model.faces.faces.len();
                     let mut model_faces = model.faces.clone();
                     if !model.has_texture_size {
-                        model_faces.uv_size = (
-                            image.width() as f32,
-                            image.height() as f32,
-                        );
+                        model_faces.uv_size = (image.width() as f32, image.height() as f32);
                     }
                     scale_model_faces_to_image(&mut model_faces, &image);
                     if !model_faces.faces.is_empty()
@@ -381,6 +398,7 @@ fn process_one(
         animated,
         stitched,
         wrapped: wrap,
+        copied: false,
     })
 }
 
@@ -532,7 +550,10 @@ fn texture_ctx(relative_path: &str) -> Option<TextureCtx> {
     let rest = relative_path.strip_prefix("entity/")?;
     // Slot subdir only exists for deeper paths like equipment/humanoid/x.png.
     let subdir = if rest.split('/').count() >= 3 {
-        rest.split('/').nth(1).map(normalize_key).unwrap_or_default()
+        rest.split('/')
+            .nth(1)
+            .map(normalize_key)
+            .unwrap_or_default()
     } else {
         String::new()
     };
@@ -581,8 +602,11 @@ fn equipment_target(subdir: &str) -> Option<&'static str> {
         "horsebody" => Some("abstractequine"),
         "camelsaddle" | "camelhusksaddle" => Some("camelsaddle"),
         "nautilussaddle" => Some("nautilussaddle"),
-        "horsesaddle" | "mulesaddle" | "donkeysaddle"
-        | "skeletonhorsesaddle" | "zombiahorsesaddle" => Some("equinesaddle"),
+        "horsesaddle"
+        | "mulesaddle"
+        | "donkeysaddle"
+        | "skeletonhorsesaddle"
+        | "zombiahorsesaddle" => Some("equinesaddle"),
         _ => None,
     }
 }
@@ -722,7 +746,8 @@ fn score_model(model: &EntityModel, ctx: &TextureCtx) -> i64 {
     if signal_score(model, ctx) < MIN_SIGNAL {
         return i64::MIN / 4; // ineligible, but comparable for max()
     }
-    signal_score(model, ctx) + model.faces.faces.len() as i64
+    signal_score(model, ctx)
+        + model.faces.faces.len() as i64
         + if model.has_texture_size { 300 } else { 0 }
 }
 
@@ -925,15 +950,16 @@ mod tests {
             model_key("net.minecraft.client.model.ZombieVillagerModel"),
             "zombievillager"
         );
-        assert_eq!(model_key("net.minecraft.client.model.PlayerModel"), "player");
+        assert_eq!(
+            model_key("net.minecraft.client.model.PlayerModel"),
+            "player"
+        );
         assert_eq!(strip_key_prefix("adultwolf"), "wolf");
         assert_eq!(strip_key_prefix("coldcow"), "cow");
         assert_eq!(strip_key_prefix("cow"), "cow");
         assert_eq!(strip_key_prefix("babyzombievillager"), "zombievillager");
         assert!(texture_ctx("entity/wolf/wolf_baby.png").unwrap().wants_baby);
-        assert!(
-            texture_ctx("entity/cow/cow_cold.png").unwrap().wants_cold
-        );
+        assert!(texture_ctx("entity/cow/cow_cold.png").unwrap().wants_cold);
         assert_eq!(
             texture_ctx("entity/equipment/humanoid/iron.png")
                 .unwrap()
@@ -1386,10 +1412,7 @@ mod tests {
     #[test]
     fn animation_frame_size_defaults_to_square_frames() {
         assert_eq!(animation_frame_size(16, 320, &json!({})), (16, 16));
-        assert_eq!(
-            animation_frame_size(16, 320, &json!({"width": 8})),
-            (8, 8)
-        );
+        assert_eq!(animation_frame_size(16, 320, &json!({"width": 8})), (8, 8));
         assert_eq!(
             animation_frame_size(16, 320, &json!({"width": 4, "height": 2})),
             (4, 2)
@@ -1410,7 +1433,7 @@ mod tests {
     }
 
     #[test]
-    fn colormap_paths_are_skipped() {
+    fn colormap_paths_are_detected() {
         assert!(is_colormap_texture_path("colormap/grass.png"));
         assert!(is_colormap_texture_path("colormap/foliage.png"));
         assert!(is_colormap_texture_path(
@@ -1422,10 +1445,7 @@ mod tests {
 
     #[test]
     fn batch_upscales_jar_into_resource_pack() {
-        let root = std::env::temp_dir().join(format!(
-            "xbrstudio-jar-batch-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("xbrstudio-jar-batch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let model_dir = root.join("models");
         std::fs::create_dir_all(&model_dir).unwrap();
@@ -1491,12 +1511,17 @@ mod tests {
         };
 
         let report = upscale_jar(&jar_path, &out_dir, &opts, |_| {}).unwrap();
-        assert_eq!(report.total, 5, "colormap/grass.png must be skipped");
+        assert_eq!(report.total, 6, "errors: {:?}", report.errors);
         assert_eq!(report.upscaled, 5, "errors: {:?}", report.errors);
+        assert_eq!(report.copied, 1, "colormap/grass.png must be copied");
         assert!(report.errors.is_empty(), "{:?}", report.errors);
-        assert!(!out_dir
-            .join("assets/minecraft/textures/colormap/grass.png")
-            .exists());
+        let grass_out = out_dir.join("assets/minecraft/textures/colormap/grass.png");
+        assert!(grass_out.exists(), "colormap must be present");
+        assert_eq!(
+            std::fs::read(&grass_out).unwrap(),
+            png_bytes(256, 256, [10, 200, 10, 255]),
+            "colormap must be copied byte-for-byte, not re-encoded upscaled"
+        );
         assert_eq!(report.animated, 1);
         assert_eq!(report.stitched, 2, "cow + wolf should stitch");
         assert_eq!(report.wrapped, 2, "stone + lava (block/) should wrap");
@@ -1514,16 +1539,13 @@ mod tests {
             image::open(out_dir.join("assets/minecraft/textures/block/lava_still.png")).unwrap();
         assert_eq!((lava.width(), lava.height()), (4 * 2, 12 * 2));
 
-        let cow = image::open(
-            out_dir.join("assets/minecraft/textures/entity/cow/test_cow.png"),
-        )
-        .unwrap();
+        let cow =
+            image::open(out_dir.join("assets/minecraft/textures/entity/cow/test_cow.png")).unwrap();
         assert_eq!((cow.width(), cow.height()), (16 * 2, 16 * 2));
 
-        let armor = image::open(out_dir.join(
-            "assets/minecraft/textures/entity/equipment/test_armor.png",
-        ))
-        .unwrap();
+        let armor =
+            image::open(out_dir.join("assets/minecraft/textures/entity/equipment/test_armor.png"))
+                .unwrap();
         assert_eq!((armor.width(), armor.height()), (16 * 2, 16 * 2));
 
         let lava_meta: Value = serde_json::from_str(
@@ -1543,10 +1565,9 @@ mod tests {
         .unwrap();
         assert!(stone_meta.contains("mipmap_strategy"));
 
-        let pack: Value = serde_json::from_str(
-            &std::fs::read_to_string(out_dir.join("pack.mcmeta")).unwrap(),
-        )
-        .unwrap();
+        let pack: Value =
+            serde_json::from_str(&std::fs::read_to_string(out_dir.join("pack.mcmeta")).unwrap())
+                .unwrap();
         assert_eq!(pack["pack"]["pack_format"], json!(97));
 
         assert!(!out_dir.join("version.json").exists());

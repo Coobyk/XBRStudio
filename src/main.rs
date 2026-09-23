@@ -4,7 +4,7 @@ use clap::Parser;
 
 use xbrstudio::jar::{self, BatchOptions, BatchProgress};
 use xbrstudio::model::{self, load_model};
-use xbrstudio::upscaling::{self, upscale_image, UpscaleConfig};
+use xbrstudio::upscaling::{self, UpscaleConfig, upscale_image};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -140,10 +140,7 @@ fn run_single(cli: &Cli, input: &Path) -> Result<(), String> {
 
 fn run_batch(cli: &Cli, jar_path: &Path) -> Result<(), String> {
     let out_dir = cli.output.clone().unwrap_or_else(|| {
-        let stem = jar_path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy();
+        let stem = jar_path.file_stem().unwrap_or_default().to_string_lossy();
         let parent = jar_path.parent().unwrap_or_else(|| Path::new("."));
         parent.join(format!("{stem}_x{}", cli.factor))
     });
@@ -170,10 +167,11 @@ fn run_batch(cli: &Cli, jar_path: &Path) -> Result<(), String> {
     })?;
 
     println!(
-        "{} -> {} ({} textures upscaled, factor {})",
+        "{} -> {} ({} textures upscaled, {} colormaps copied, factor {})",
         jar_path.display(),
         out_dir.display(),
         report.upscaled,
+        report.copied,
         cli.factor
     );
     if report.wrapped > 0 {

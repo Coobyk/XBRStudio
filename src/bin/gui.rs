@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
+use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
 use gpui::{
@@ -11,8 +11,8 @@ use gpui::{
 use image::RgbaImage;
 
 use xbrstudio::jar::{BatchOptions, BatchProgress, JarMessage, is_wrap_texture_path, spawn_batch};
-use xbrstudio::model::{load_model, ModelFaces};
-use xbrstudio::upscaling::{upscale_image, upscale_wrapped, UpscaleConfig};
+use xbrstudio::model::{ModelFaces, load_model};
+use xbrstudio::upscaling::{UpscaleConfig, upscale_image, upscale_wrapped};
 
 actions!(xbrstudio, [Quit]);
 
@@ -323,9 +323,16 @@ impl AppView {
                                             let mut summary = format!(
                                                 "Upscaled {}/{} textures to {} (x{factor})",
                                                 report.upscaled,
-                                                report.total,
+                                                report.upscaled + report.copied,
                                                 out_dir.display()
                                             );
+                                            if report.copied > 0 {
+                                                summary.push_str(&format!(
+                                                    ", {} colormap{} copied as-is",
+                                                    report.copied,
+                                                    if report.copied == 1 { "" } else { "s" }
+                                                ));
+                                            }
                                             if report.wrapped > 0 {
                                                 summary.push_str(&format!(
                                                     ", {} block-wrapped",
@@ -402,7 +409,13 @@ impl AppView {
         cx.notify();
     }
 
-    fn set_factor(&mut self, factor: u32, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn set_factor(
+        &mut self,
+        factor: u32,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.factor != factor {
             self.factor = factor;
             self.clear_result();
@@ -639,7 +652,10 @@ impl AppView {
                 self.status = format!(
                     "Loaded model {} ({} faces).",
                     path.display(),
-                    self.model_faces.as_ref().map(|m| m.faces.len()).unwrap_or(0)
+                    self.model_faces
+                        .as_ref()
+                        .map(|m| m.faces.len())
+                        .unwrap_or(0)
                 );
                 self.error = None;
             }
@@ -670,7 +686,11 @@ impl Render for AppView {
             .as_deref()
             .map(|path| format!("model: {}", path.display()))
             .unwrap_or_else(|| "model: —".into());
-        let face_count = self.model_faces.as_ref().map(|m| m.faces.len()).unwrap_or(0);
+        let face_count = self
+            .model_faces
+            .as_ref()
+            .map(|m| m.faces.len())
+            .unwrap_or(0);
         let zoom = self.zoom;
         let source_image = self.source_image.clone();
         let result_image = self.result_image.clone();
@@ -949,11 +969,7 @@ fn preview_panel(
         .min_w(px(0.))
         .w_full()
         .h_full()
-        .child(
-            div()
-                .text_color(rgb(0xb0b0b0))
-                .child(size_label),
-        )
+        .child(div().text_color(rgb(0xb0b0b0)).child(size_label))
         .child(
             div()
                 .size_full()
