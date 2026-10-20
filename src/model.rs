@@ -92,12 +92,26 @@ struct RawEntityPart {
 
 #[derive(Deserialize)]
 struct RawEntityCube {
+    /// The corner of the cube. It can be an expression (the models are
+    /// extracted from code), so it is kept as a value.
     #[serde(default)]
-    origin: [f32; 3],
+    origin: Vec<Value>,
     #[serde(default)]
     size: [f32; 3],
     #[serde(default)]
     uv: [f32; 2],
+}
+
+/// The numbers of a list of values, when they all are numbers.
+fn numbers_of(values: &[Value]) -> Option<[f32; 3]> {
+    if values.len() != 3 {
+        return None;
+    }
+    let mut numbers = [0.0f32; 3];
+    for (index, value) in values.iter().enumerate() {
+        numbers[index] = value.as_f64()? as f32;
+    }
+    Some(numbers)
 }
 
 pub fn load_model(path: &std::path::Path) -> Result<ModelFaces, String> {
@@ -381,7 +395,7 @@ fn collect_entity_faces_named(
                 },
                 face: face_name.into(),
                 group,
-                origin: Some(cube.origin),
+                origin: numbers_of(&cube.origin),
                 size: Some(cube.size),
                 part: part_name.clone(),
             });

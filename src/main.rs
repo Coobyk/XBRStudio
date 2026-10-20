@@ -56,6 +56,10 @@ struct Cli {
     #[arg(long, default_value_t = 0.0)]
     sharpen: f32,
 
+    /// Use the GPU for the edge adaptive upscaler.
+    #[arg(long)]
+    gpu: bool,
+
     /// Upscale without model-face stitching.
     #[arg(long)]
     no_stitch: bool,
@@ -116,6 +120,16 @@ fn main() {
 
 fn run(cli: Cli) -> Result<(), String> {
     let config = Config::load(cli.config.as_deref())?;
+
+    if cli.gpu {
+        #[cfg(feature = "gpu")]
+        match xbrstudio::gpu::init() {
+            Ok(()) => println!("using the GPU for the edge adaptive upscaler"),
+            Err(error) => eprintln!("note: {error}"),
+        }
+        #[cfg(not(feature = "gpu"))]
+        eprintln!("note: this build has no GPU backend");
+    }
 
     let factor = if cli.factor == 4 {
         config.factor.unwrap_or(cli.factor)

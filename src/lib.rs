@@ -1,6 +1,8 @@
 pub mod cache;
 pub mod config;
 pub mod ctm;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod jar;
 pub mod java;
 pub mod model;

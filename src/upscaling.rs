@@ -67,7 +67,15 @@ pub fn scale_plain(image: &RgbaImage, config: &UpscaleConfig) -> Result<RgbaImag
 
     let mut scaled = match config.algorithm {
         Algorithm::Xbrz | Algorithm::Nearest => config.algorithm.scale(&source, config.factor)?,
-        Algorithm::Fsr => crate::scalers::fsr::scale_fsr(&source, config.factor),
+        Algorithm::Fsr => {
+            // The GPU backend runs the same algorithm, so the result is the
+            // same up to the rounding.
+            #[cfg(feature = "gpu")]
+            if let Some(context) = crate::gpu::context() {
+                return context.upscale(&source, config.factor);
+            }
+            crate::scalers::fsr::scale_fsr(&source, config.factor)
+        }
         Algorithm::Lanczos3 | Algorithm::Bicubic => {
             let kernel: &dyn crate::scalers::resample::Kernel = match config.algorithm {
                 Algorithm::Lanczos3 => &crate::scalers::resample::Lanczos3,
