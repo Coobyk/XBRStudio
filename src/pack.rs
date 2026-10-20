@@ -210,9 +210,13 @@ pub fn read_pack_mcmeta(zip_path: &Path) -> Option<Value> {
 mod tests {
     use super::*;
 
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("xbrstudio-{name}-{}", std::process::id()))
+    }
+
     #[test]
     fn writes_pack_mcmeta_with_the_pack_format() {
-        let dir = std::env::temp_dir().join(format!("xbrstudio-pack-{}", std::process::id()));
+        let dir = temp_dir("pack-mcmeta");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -231,7 +235,7 @@ mod tests {
 
     #[test]
     fn writes_mipmap_levels_and_supported_formats() {
-        let dir = std::env::temp_dir().join(format!("xbrstudio-pack-{}", std::process::id()));
+        let dir = temp_dir("pack-mipmap");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -252,7 +256,7 @@ mod tests {
 
     #[test]
     fn zips_a_directory() {
-        let dir = std::env::temp_dir().join(format!("xbrstudio-zip-{}", std::process::id()));
+        let dir = temp_dir("pack-zip");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("assets/minecraft/textures/block")).unwrap();
         std::fs::write(dir.join("pack.mcmeta"), "{}").unwrap();
