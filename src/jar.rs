@@ -14,6 +14,7 @@ use crate::model::{
     resolve_block_models, scale_model_faces_to_image,
 };
 use crate::cache::{Cache, fingerprint, settings_fingerprint};
+use crate::ctm::{self, BlockFaces};
 use crate::pack::PackOptions;
 use crate::scalers::{Algorithm, AlphaMode};
 use crate::upscaling::{UpscaleConfig, upscale_image, upscale_wrapped};
@@ -40,6 +41,8 @@ pub struct BatchReport {
     pub unmatched_entity: Vec<String>,
     /// Textures that were already up to date and were skipped.
     pub skipped: usize,
+    /// Blocks that got OptiFine connected textures.
+    pub connected_textures: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +86,9 @@ pub struct BatchOptions {
     pub resume: bool,
     /// What ends up in pack.mcmeta.
     pub pack: PackOptions,
+    /// Also write OptiFine connected textures for blocks with several
+    /// different faces.
+    pub connected_textures: bool,
 }
 
 impl Default for BatchOptions {
@@ -98,6 +104,7 @@ impl Default for BatchOptions {
             only: None,
             resume: false,
             pack: PackOptions::default(),
+            connected_textures: false,
         }
     }
 }
@@ -167,6 +174,8 @@ struct ProcessOutcome {
     copied: bool,
     /// The texture was already up to date and was not processed again.
     skipped: bool,
+    /// The block got connected textures.
+    connected: bool,
 }
 
 pub fn default_model_dir() -> Option<PathBuf> {
@@ -314,6 +323,7 @@ pub fn upscale_jar(
                             wrapped: false,
                             copied: false,
                             skipped: true,
+                            connected: false,
                         })
                     } else {
                         let result = process_one(
@@ -365,6 +375,7 @@ pub fn upscale_jar(
         block_models: block_models.len(),
         unmatched_entity: Vec::new(),
         skipped: 0,
+        connected_textures: 0,
     };
 
     for (name, outcome) in results {
@@ -392,6 +403,9 @@ pub fn upscale_jar(
                 }
                 if outcome.wrapped {
                     report.wrapped += 1;
+                }
+                if outcome.connected {
+                    report.connected_textures += 1;
                 }
             }
             Err(error) => report.errors.push((short.to_string(), error)),
@@ -451,6 +465,7 @@ fn process_one(
             wrapped: false,
             copied: true,
             skipped: false,
+            connected: false,
         });
     }
 
@@ -543,6 +558,14 @@ fn process_one(
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
 
+    let mut connected = false;
+    if opts.connected_textures
+        && let Some(model) = block_model
+        && let Some(stem) = block_stem
+    {
+        connected = write_connected_textures(out_dir, &stem, model, &output, opts.factor)?;
+    }
+
     let mut png = Vec::new();
     DynamicImage::ImageRgba8(output)
         .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
@@ -564,7 +587,45 @@ fn process_one(
         wrapped: wrap,
         copied: false,
         skipped: false,
+        connected,
     })
+}
+
+/// Write the OptiFine connected textures of a block.
+///
+/// The faces are cut out of the upscaled texture, so the tiles match the
+/// pack the player sees.
+fn write_connected_textures(
+    out_dir: &Path,
+    stem: &str,
+    model: &ModelFaces,
+    upscaled: &RgbaImage,
+    factor: u32,
+) -> Result<bool, String> {
+    let mut faces = BlockFaces::default();
+    for name in ["up", "down", "north", "south", "east", "west"] {
+        let Some(face) = model.faces.iter().find(|face| face.face == name) else {
+            continue;
+        };
+        let x = face.rect.x * factor;
+        let y = face.rect.y * factor;
+        let width = face.rect.width * factor;
+        let height = face.rect.height * factor;
+        if x + width > upscaled.width() || y + height > upscaled.height() {
+            continue;
+        }
+        let image = image::imageops::crop_imm(upscaled, x, y, width, height).to_image();
+        faces.insert(name, image);
+    }
+
+    if faces.faces.len() < 4 {
+        // Not enough faces for a connected texture.
+        return Ok(false);
+    }
+
+    let tiles = ctm::compose_tiles(&faces);
+    ctm::write_block(out_dir, stem, stem, &tiles)?;
+    Ok(true)
 }
 
 fn upscale_animated(

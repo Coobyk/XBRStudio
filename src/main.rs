@@ -80,6 +80,10 @@ struct Cli {
     #[arg(long)]
     mipmap_levels: Option<u32>,
 
+    /// Also write OptiFine connected textures for blocks with several faces.
+    #[arg(long)]
+    connected_textures: bool,
+
     /// Only process textures whose path contains this substring.
     #[arg(long)]
     only: Option<String>,
@@ -284,6 +288,8 @@ fn run_batch(
         only: cli.only.clone(),
         resume: cli.resume || config.resume.unwrap_or(false),
         pack: pack_options,
+        connected_textures: cli.connected_textures
+            || config.connected_textures.unwrap_or(false),
     };
 
     let report = jar::upscale_jar(jar_path, &out_dir, &opts, |progress| match progress {
@@ -325,6 +331,12 @@ fn run_batch(
         println!(
             "  textures stitched with {} entity + {} block models: {}",
             report.entity_models, report.block_models, report.stitched
+        );
+    }
+    if report.connected_textures > 0 {
+        println!(
+            "  blocks with connected textures: {}",
+            report.connected_textures
         );
     }
     if !report.unmatched_entity.is_empty() {
