@@ -59,9 +59,11 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
-    let model_dir = cli.models.clone().or_else(jar::default_model_dir).ok_or(
-        "no model directory found — pass --models <dir> (expected models/entity)",
-    )?;
+    let model_dir = cli
+        .models
+        .clone()
+        .or_else(jar::default_model_dir)
+        .ok_or("no model directory found — pass --models <dir> (expected models/entity)")?;
     let textures_root = cli.upscaled.join("assets/minecraft/textures");
     if !textures_root.is_dir() {
         return Err(format!(
@@ -125,11 +127,11 @@ fn export(
         .expect("index built with pairs");
     for (slot, pair) in pairs.iter_mut().zip(pairs_json) {
         let id = pair["id"].as_str().unwrap_or_default();
-        let upscaled =
-            fs::read(textures_root.join(format!("{id}.png"))).map_err(|error| {
-                format!("cannot read upscaled texture {id}.png: {error}")
-            })?;
-        let orig = orig_textures.get(id).ok_or_else(|| format!("missing original {id}"))?;
+        let upscaled = fs::read(textures_root.join(format!("{id}.png")))
+            .map_err(|error| format!("cannot read upscaled texture {id}.png: {error}"))?;
+        let orig = orig_textures
+            .get(id)
+            .ok_or_else(|| format!("missing original {id}"))?;
         slot["u"] = Value::String(data_url(&upscaled));
         slot["o"] = Value::String(data_url(orig));
     }
@@ -141,7 +143,9 @@ fn export(
         "wrote {} ({} pairs, {:.1} MB)",
         path.display(),
         pairs_json.len(),
-        fs::metadata(path).map(|meta| meta.len() as f64 / 1e6).unwrap_or(0.0)
+        fs::metadata(path)
+            .map(|meta| meta.len() as f64 / 1e6)
+            .unwrap_or(0.0)
     );
     Ok(())
 }
@@ -223,11 +227,7 @@ fn handle_client(mut stream: TcpStream, site: &Site) -> Result<(), std::io::Erro
     }
 }
 
-fn serve_texture(
-    stream: TcpStream,
-    site: &Site,
-    rest: &str,
-) -> Result<(), std::io::Error> {
+fn serve_texture(stream: TcpStream, site: &Site, rest: &str) -> Result<(), std::io::Error> {
     let Some((id, variant)) = rest.rsplit_once('/') else {
         return respond(stream, 404, "text/plain", b"not found");
     };
@@ -286,8 +286,7 @@ fn data_url(bytes: &[u8]) -> String {
 }
 
 fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b = [

@@ -9,12 +9,12 @@ use rayon::prelude::*;
 use serde_json::{Value, json};
 use zip::ZipArchive;
 
+use crate::cache::{Cache, fingerprint, settings_fingerprint};
+use crate::ctm::{self, BlockFaces};
 use crate::model::{
     ModelFaces, block_texture_stems, is_atlas_layout, merge_model_faces, parse_model,
     resolve_block_models, scale_model_faces_to_image,
 };
-use crate::cache::{Cache, fingerprint, settings_fingerprint};
-use crate::ctm::{self, BlockFaces};
 use crate::pack::PackOptions;
 use crate::scalers::{Algorithm, AlphaMode};
 use crate::upscaling::{UpscaleConfig, upscale_image, upscale_wrapped};
@@ -183,10 +183,10 @@ struct ProcessOutcome {
 
 pub fn default_model_dir() -> Option<PathBuf> {
     let mut candidates = vec![PathBuf::from("models/entity")];
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(directory) = executable.parent() {
-            candidates.push(directory.join("models/entity"));
-        }
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        candidates.push(directory.join("models/entity"));
     }
     candidates.into_iter().find(|path| path.is_dir())
 }
@@ -436,10 +436,9 @@ pub fn upscale_jar(
 
     if let Some(cache) = cache
         && let Ok(cache) = cache.into_inner()
+        && let Err(error) = cache.save()
     {
-        if let Err(error) = cache.save() {
-            report.errors.push(("cache".into(), error));
-        }
+        report.errors.push(("cache".into(), error));
     }
 
     report.errors.sort();
@@ -514,8 +513,13 @@ fn process_one(
     let (output, out_mcmeta, animated, stitched) = if is_animated {
         let value = mcmeta_value.clone().expect("checked above");
         let animation = value.get("animation").expect("checked above");
-        let (upscaled, stitched) =
-            upscale_animated(&image, animation, &opts.upscale_config(false), wrap, block_model)?;
+        let (upscaled, stitched) = upscale_animated(
+            &image,
+            animation,
+            &opts.upscale_config(false),
+            wrap,
+            block_model,
+        )?;
         if stitched {
             wrap = false;
         }
@@ -669,12 +673,8 @@ fn upscale_animated(
                 let mut model_faces = model.clone();
                 scale_model_faces_to_image(&mut model_faces, &band);
                 if !model_faces.faces.is_empty() {
-                    return upscale_image(
-                        &band,
-                        Some(model_faces.faces.as_slice()),
-                        &config,
-                    )
-                    .map(|image| (image, true));
+                    return upscale_image(&band, Some(model_faces.faces.as_slice()), config)
+                        .map(|image| (image, true));
                 }
             }
             let upscaled = if wrap {
@@ -726,10 +726,10 @@ fn scale_animation_fields(value: &mut Value, factor: u32) {
         return;
     };
     for key in ["width", "height"] {
-        if let Some(field) = animation.get_mut(key) {
-            if let Some(pixels) = field.as_u64() {
-                *field = json!(pixels * u64::from(factor));
-            }
+        if let Some(field) = animation.get_mut(key)
+            && let Some(pixels) = field.as_u64()
+        {
+            *field = json!(pixels * u64::from(factor));
         }
     }
 }
@@ -784,13 +784,10 @@ fn strip_variant_tokens(stem: &str) -> (String, bool, bool, bool) {
     let mut wants_baby = false;
     let mut wants_cold = false;
     let mut wants_warm = false;
-    loop {
-        let Some(token) = ["baby", "pup", "cold", "warm", "temperate"]
-            .into_iter()
-            .find(|token| text.len() > token.len() && text.ends_with(token))
-        else {
-            break;
-        };
+    while let Some(token) = ["baby", "pup", "cold", "warm", "temperate"]
+        .into_iter()
+        .find(|token| text.len() > token.len() && text.ends_with(token))
+    {
         match token {
             "baby" | "pup" => wants_baby = true,
             "cold" => wants_cold = true,
@@ -908,9 +905,9 @@ fn signal_score(model: &EntityModel, ctx: &TextureCtx) -> i64 {
             signal += 3400;
         } else if ctx.stripped == base {
             signal += 3200;
-        } else if key.starts_with(ctx.stripped.as_str()) && key.len() > ctx.stripped.len() {
-            signal += 3000;
-        } else if ctx.stripped.starts_with(key) && ctx.stripped.len() > key.len() {
+        } else if (key.starts_with(ctx.stripped.as_str()) && key.len() > ctx.stripped.len())
+            || (ctx.stripped.starts_with(key) && ctx.stripped.len() > key.len())
+        {
             signal += 3000;
         }
     }
@@ -1094,9 +1091,7 @@ fn model_eligible(model: &EntityModel, ctx: &TextureCtx) -> bool {
         || base == ctx.stripped
         || ctx.stripped.starts_with(key)
         || ctx.stripped.starts_with(base)
-        || (model_baby
-            && ctx.wants_baby
-            && model.pkg_dirs.iter().any(|dir| dir == &ctx.family))
+        || (model_baby && ctx.wants_baby && model.pkg_dirs.iter().any(|dir| dir == &ctx.family))
 }
 
 fn load_entity_models(model_dir: &Path) -> Vec<EntityModel> {
@@ -1204,8 +1199,7 @@ pub fn load_preview_pairs(
 
     let file = File::open(jar_path)
         .map_err(|error| format!("cannot open {}: {error}", jar_path.display()))?;
-    let mut archive =
-        ZipArchive::new(file).map_err(|error| format!("cannot read jar: {error}"))?;
+    let mut archive = ZipArchive::new(file).map_err(|error| format!("cannot read jar: {error}"))?;
     let mut index_by_name: HashMap<String, usize> = HashMap::with_capacity(archive.len());
     for index in 0..archive.len() {
         let name = archive
@@ -1780,10 +1774,10 @@ mod tests {
                 },
                 face: "top".into(),
                 group: 0,
-            origin: None,
-            size: None,
-part: None,
-})
+                origin: None,
+                size: None,
+                part: None,
+            })
             .collect();
         EntityModel {
             faces: crate::model::ModelFaces {

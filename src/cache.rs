@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// The cache file name inside the output directory.
 pub const CACHE_FILE_NAME: &str = ".xbrstudio-cache.json";
@@ -45,7 +45,8 @@ impl Cache {
 
     /// Remember that `key` was processed with these settings.
     pub fn record(&mut self, key: &str, fingerprint: &str) {
-        self.entries.insert(key.to_string(), fingerprint.to_string());
+        self.entries
+            .insert(key.to_string(), fingerprint.to_string());
     }
 
     /// Write the cache back to disk.
@@ -53,8 +54,8 @@ impl Cache {
         let file = CacheFile {
             entries: self.entries.clone(),
         };
-        let data = serde_json::to_vec_pretty(&file)
-            .map_err(|error| format!("encode cache: {error}"))?;
+        let data =
+            serde_json::to_vec_pretty(&file).map_err(|error| format!("encode cache: {error}"))?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;

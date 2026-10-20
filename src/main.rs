@@ -135,7 +135,7 @@ fn run(cli: Cli) -> Result<(), String> {
         config
             .models
             .as_ref()
-            .map(|path| PathBuf::from(path))
+            .map(PathBuf::from)
             .or_else(jar::default_model_dir)
     });
 
@@ -146,27 +146,11 @@ fn run(cli: Cli) -> Result<(), String> {
     match (&cli.input, &cli.jar) {
         (Some(_), Some(_)) => Err("pass either a texture path or --jar, not both".into()),
         (None, None) => Err("provide a texture path, or --jar <file.jar>".into()),
-        (Some(input), None) => run_single(
-            &cli,
-            input,
-            factor,
-            algorithm,
-            alpha,
-            sharpen,
-            stitch,
-            wrap,
-        ),
+        (Some(input), None) => {
+            run_single(&cli, input, factor, algorithm, alpha, sharpen, stitch, wrap)
+        }
         (None, Some(jar_path)) => run_batch(
-            &cli,
-            jar_path,
-            factor,
-            algorithm,
-            alpha,
-            sharpen,
-            stitch,
-            wrap,
-            model_dir,
-            &config,
+            &cli, jar_path, factor, algorithm, alpha, sharpen, stitch, wrap, model_dir, &config,
         ),
     }
 }
@@ -185,7 +169,10 @@ fn run_convert_skin(cli: &Cli, legacy_path: &Path) -> Result<(), String> {
     let modern = xbrstudio::skin::convert(&legacy, &model)?;
 
     let output_path = cli.output.clone().unwrap_or_else(|| {
-        let stem = legacy_path.file_stem().unwrap_or_default().to_string_lossy();
+        let stem = legacy_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy();
         legacy_path.with_file_name(format!("{stem}_modern.png"))
     });
     if let Some(parent) = output_path.parent()
@@ -316,7 +303,10 @@ fn run_batch(
 
     let pack_options = PackOptions {
         pack_format: cli.pack_format.or(config.pack_format),
-        description: cli.pack_description.clone().or(config.pack_description.clone()),
+        description: cli
+            .pack_description
+            .clone()
+            .or(config.pack_description.clone()),
         mipmap_levels: cli.mipmap_levels.or(config.mipmap_levels),
         min_format: None,
         max_format: None,
@@ -333,8 +323,7 @@ fn run_batch(
         only: cli.only.clone(),
         resume: cli.resume || config.resume.unwrap_or(false),
         pack: pack_options,
-        connected_textures: cli.connected_textures
-            || config.connected_textures.unwrap_or(false),
+        connected_textures: cli.connected_textures || config.connected_textures.unwrap_or(false),
         cancel: None,
     };
 
@@ -365,7 +354,10 @@ fn run_batch(
         algorithm.name()
     );
     if report.skipped > 0 {
-        println!("  textures skipped (already up to date): {}", report.skipped);
+        println!(
+            "  textures skipped (already up to date): {}",
+            report.skipped
+        );
     }
     if report.wrapped > 0 {
         println!("  textures with tiled wrap: {}", report.wrapped);

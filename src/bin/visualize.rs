@@ -95,7 +95,7 @@ fn overlay_faces(image: &RgbaImage, faces: &[ModelFace]) -> RgbaImage {
         for y in rect.y.min(height)..y_end {
             for x in rect.x.min(width)..x_end {
                 let pixel = out.get_pixel_mut(x, y);
-                for channel in 0..3 {
+                for (channel, _) in color.iter().enumerate().take(3) {
                     let base = pixel.0[channel] as f32;
                     let fill = color[channel] as f32;
                     pixel.0[channel] =
@@ -153,11 +153,11 @@ fn run(cli: Cli) -> Result<(), String> {
             .to_string_lossy();
         cli.texture.with_file_name(format!("{stem}_faces.png"))
     });
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-        }
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
     marked
         .save(&output)
@@ -197,10 +197,10 @@ mod tests {
             },
             face: name.into(),
             group: 0,
-        origin: None,
-        size: None,
-part: None,
-}
+            origin: None,
+            size: None,
+            part: None,
+        }
     }
 
     #[test]

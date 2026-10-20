@@ -531,12 +531,15 @@ fn cubes_of(chain: &str) -> Vec<ExtractedCube> {
         if numbers.len() >= 6 {
             let origin = [numbers[0], numbers[1], numbers[2]];
             let size = [numbers[3], numbers[4], numbers[5]];
-            let deform = args.get(6).map(|arg| arg.trim().to_string()).filter(|text| {
-                !text.is_empty()
-                    && !text
-                        .chars()
-                        .all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == ' ')
-            });
+            let deform = args
+                .get(6)
+                .map(|arg| arg.trim().to_string())
+                .filter(|text| {
+                    !text.is_empty()
+                        && !text
+                            .chars()
+                            .all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == ' ')
+                });
             let mirror = args.get(7).map(|arg| arg.trim() == "true").unwrap_or(false);
             cubes.push(ExtractedCube {
                 origin,
@@ -684,7 +687,10 @@ public class CowModel {
         let models = extract_file(COW, "CowModel.java");
         assert_eq!(models.len(), 1);
         let model = &models[0];
-        assert_eq!(model.model, "net.minecraft.client.model.animal.cow.CowModel");
+        assert_eq!(
+            model.model,
+            "net.minecraft.client.model.animal.cow.CowModel"
+        );
         assert_eq!(model.method, "createBodyLayer");
         assert_eq!(model.texture_size, Some([64.0, 64.0]));
         assert_eq!(model.parts.len(), 1);
@@ -741,7 +747,9 @@ public class CowModel {
 
     #[test]
     fn splits_arguments() {
-        let args = split_args("\"head\", CubeListBuilder.create().addBox(1.0F, 2.0F, 3.0F), PartPose.ZERO");
+        let args = split_args(
+            "\"head\", CubeListBuilder.create().addBox(1.0F, 2.0F, 3.0F), PartPose.ZERO",
+        );
         assert_eq!(args.len(), 3);
         assert_eq!(args[0], "\"head\"");
         assert!(args[1].contains("addBox"));
@@ -772,7 +780,9 @@ public class CowModel {
 
     #[test]
     fn keeps_unresolvable_expressions_as_text() {
-        let cubes = cubes_of("CubeListBuilder.create().texOffs(0, 0).addBox(-4.0F, -4.0F, -6.0F, 8.0F, 8.0F, 6.0F, g.extend(0.5F))");
+        let cubes = cubes_of(
+            "CubeListBuilder.create().texOffs(0, 0).addBox(-4.0F, -4.0F, -6.0F, 8.0F, 8.0F, 6.0F, g.extend(0.5F))",
+        );
         assert_eq!(cubes.len(), 1);
         assert_eq!(cubes[0].deform.as_deref(), Some("g.extend(0.5F)"));
     }

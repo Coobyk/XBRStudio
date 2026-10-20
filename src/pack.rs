@@ -187,12 +187,8 @@ pub fn install_pack(zip_path: &Path) -> Result<PathBuf, String> {
         .file_name()
         .ok_or_else(|| "the pack zip has no file name".to_string())?;
     let destination = target.join(file_name);
-    std::fs::copy(zip_path, &destination).map_err(|error| {
-        format!(
-            "cannot install into {}: {error}",
-            destination.display()
-        )
-    })?;
+    std::fs::copy(zip_path, &destination)
+        .map_err(|error| format!("cannot install into {}: {error}", destination.display()))?;
     Ok(destination)
 }
 
@@ -224,7 +220,12 @@ mod tests {
         let data = std::fs::read_to_string(dir.join("pack.mcmeta")).unwrap();
         let value: Value = serde_json::from_str(&data).unwrap();
         assert_eq!(value["pack"]["pack_format"], json!(97));
-        assert!(value["pack"]["description"].as_str().unwrap().contains("x4"));
+        assert!(
+            value["pack"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("x4")
+        );
 
         // An existing file is not overwritten.
         write_pack_mcmeta(&dir, Some(1), 2, &PackOptions::default()).unwrap();
@@ -249,8 +250,14 @@ mod tests {
         let data = std::fs::read_to_string(dir.join("pack.mcmeta")).unwrap();
         let value: Value = serde_json::from_str(&data).unwrap();
         assert_eq!(value["pack"]["mipmap_levels"], json!(4));
-        assert_eq!(value["pack"]["supported_formats"]["min_inclusive"], json!(10));
-        assert_eq!(value["pack"]["supported_formats"]["max_inclusive"], json!(99));
+        assert_eq!(
+            value["pack"]["supported_formats"]["min_inclusive"],
+            json!(10)
+        );
+        assert_eq!(
+            value["pack"]["supported_formats"]["max_inclusive"],
+            json!(99)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -268,7 +275,11 @@ mod tests {
         let file = File::open(&zip_path).unwrap();
         let mut archive = ZipArchive::new(file).unwrap();
         assert!(archive.by_name("pack.mcmeta").is_ok());
-        assert!(archive.by_name("assets/minecraft/textures/block/stone.png").is_ok());
+        assert!(
+            archive
+                .by_name("assets/minecraft/textures/block/stone.png")
+                .is_ok()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

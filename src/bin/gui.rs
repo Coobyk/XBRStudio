@@ -292,7 +292,13 @@ impl AppView {
         cx.notify();
     }
 
-    fn pick_model(&mut self, name: String, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn pick_model(
+        &mut self,
+        name: String,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(source) = self.picker_source.clone() else {
             // An entity model from the model directory.
             let path = PathBuf::from("models/entity").join(&name);
@@ -327,7 +333,10 @@ impl AppView {
                 self.picker_models = names;
                 self.picker_source = Some(jar_path);
                 self.picker_open = true;
-                self.status = format!("{} models available in the picker.", self.picker_models.len());
+                self.status = format!(
+                    "{} models available in the picker.",
+                    self.picker_models.len()
+                );
             }
             Err(error) => self.set_error(error),
         }
@@ -335,7 +344,13 @@ impl AppView {
 
     // ----------------------------------------------------------------- upscale
 
-    fn set_factor(&mut self, factor: u32, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn set_factor(
+        &mut self,
+        factor: u32,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.factor != factor {
             self.factor = factor;
             self.clear_result();
@@ -357,7 +372,13 @@ impl AppView {
         }
     }
 
-    fn set_alpha(&mut self, alpha: AlphaMode, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn set_alpha(
+        &mut self,
+        alpha: AlphaMode,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.alpha != alpha {
             self.alpha = alpha;
             self.clear_result();
@@ -486,7 +507,13 @@ impl AppView {
         self.compare_image = Some(to_render_image(&image));
     }
 
-    fn set_split(&mut self, split: f32, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn set_split(
+        &mut self,
+        split: f32,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.split = split.clamp(0.0, 1.0);
         self.update_compare();
         cx.notify();
@@ -519,7 +546,14 @@ impl AppView {
         cx.notify();
     }
 
-    fn rotate_3d(&mut self, dyaw: f32, dpitch: f32, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn rotate_3d(
+        &mut self,
+        dyaw: f32,
+        dpitch: f32,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.yaw += dyaw;
         self.pitch = (self.pitch + dpitch).clamp(-1.4, 1.4);
         self.update_preview();
@@ -869,7 +903,9 @@ impl AppView {
             return;
         };
         let zip_path = dir.with_extension("zip");
-        if !zip_path.is_file() && let Err(error) = pack::zip_directory(&dir, &zip_path) {
+        if !zip_path.is_file()
+            && let Err(error) = pack::zip_directory(&dir, &zip_path)
+        {
             self.set_error(error);
             cx.notify();
             return;
@@ -899,7 +935,8 @@ fn read_animation(texture_path: &Path) -> Option<Animation> {
 
     let image = image::open(texture_path).ok()?.to_rgba8();
     let (width, height) = image.dimensions();
-    let (frame_width, frame_height) = xbrstudio::jar::animation_frame_size(width, height, animation);
+    let (frame_width, frame_height) =
+        xbrstudio::jar::animation_frame_size(width, height, animation);
     Some(Animation {
         frame_width,
         frame_height,
@@ -908,11 +945,10 @@ fn read_animation(texture_path: &Path) -> Option<Animation> {
 }
 
 fn frame_count(animation: Animation, height: u32) -> usize {
-    if animation.frame_height == 0 {
-        1
-    } else {
-        (height / animation.frame_height).max(1) as usize
-    }
+    height
+        .checked_div(animation.frame_height)
+        .map(|count| count.max(1) as usize)
+        .unwrap_or(1)
 }
 
 /// Cut one frame out of an animated texture.
@@ -1041,15 +1077,19 @@ impl Render for AppView {
         })
         .collect();
 
-        let alpha_listeners: Vec<_> = [AlphaMode::Straight, AlphaMode::Premultiplied, AlphaMode::Masked]
-            .into_iter()
-            .map(|value| {
-                let listener = cx.listener(move |view, event, window, cx| {
-                    view.set_alpha(value, event, window, cx);
-                });
-                (value, listener)
-            })
-            .collect();
+        let alpha_listeners: Vec<_> = [
+            AlphaMode::Straight,
+            AlphaMode::Premultiplied,
+            AlphaMode::Masked,
+        ]
+        .into_iter()
+        .map(|value| {
+            let listener = cx.listener(move |view, event, window, cx| {
+                view.set_alpha(value, event, window, cx);
+            });
+            (value, listener)
+        })
+        .collect();
 
         let sharpen_listeners: Vec<_> = [0.0f32, 0.25, 0.5]
             .into_iter()
@@ -1441,8 +1481,8 @@ fn box_el() -> impl IntoElement {
 
 fn to_render_image(rgba: &RgbaImage) -> Arc<RenderImage> {
     let mut bgra = rgba.clone();
-    for pixel in (&mut *bgra).chunks_exact_mut(4) {
-        pixel.swap(0, 2);
+    for pixel in bgra.pixels_mut() {
+        pixel.0.swap(0, 2);
     }
     let frame = image::Frame::new(bgra);
     Arc::new(RenderImage::new(vec![frame]))

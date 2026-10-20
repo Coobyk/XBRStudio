@@ -149,7 +149,7 @@ pub fn scale_windowed(
 
     let source = image.as_raw();
     let mut pixels = vec![[0.0f32; 4]; (width as usize) * (height as usize)];
-    for (index, chunk) in source.chunks_exact(4).enumerate() {
+    for (index, chunk) in source.as_chunks::<4>().0.iter().enumerate() {
         let alpha = chunk[3] as f32 / 255.0;
         let (r, g, b) = match handling {
             AlphaHandling::Premultiplied => (
@@ -166,9 +166,7 @@ pub fn scale_windowed(
     let y_taps = build_axis_taps(height, out_height, kernel);
 
     match handling {
-        AlphaHandling::Masked => {
-            scale_masked(image, &x_taps, &y_taps, out_width, out_height)
-        }
+        AlphaHandling::Masked => scale_masked(image, &x_taps, &y_taps, out_width, out_height),
         _ => {
             // Horizontal pass into an intermediate buffer of out_width × height.
             let mut intermediate = vec![[0.0f32; 4]; (out_width as usize) * (height as usize)];
@@ -262,7 +260,12 @@ fn scale_masked(
                     (alpha / alpha_weight).round().clamp(0.0, 255.0) as u8,
                 ])
             } else {
-                Rgba([0, 0, 0, (alpha / alpha_weight).round().clamp(0.0, 255.0) as u8])
+                Rgba([
+                    0,
+                    0,
+                    0,
+                    (alpha / alpha_weight).round().clamp(0.0, 255.0) as u8,
+                ])
             };
             out.put_pixel(x as u32, y as u32, pixel);
         }
@@ -347,7 +350,10 @@ mod tests {
         let masked = scale_windowed(&source, 2, &CatmullRom, AlphaHandling::Masked);
         let pixel = masked.get_pixel(1, 0).0;
         assert_eq!(pixel[0], 255, "masked resampling lost the opaque colour");
-        assert_eq!(pixel[1], 0, "masked resampling leaked the transparent colour");
+        assert_eq!(
+            pixel[1], 0,
+            "masked resampling leaked the transparent colour"
+        );
     }
 
     #[test]

@@ -205,8 +205,7 @@ pub fn rcas(image: &RgbaImage, sharpness: f32) -> RgbaImage {
             let down_right = *image.get_pixel((x + 1).min(width - 1), (y + 1).min(height - 1));
 
             let luma_m = luma(&center);
-            let luma_edge =
-                (luma(&left) + luma(&right) + luma(&up) + luma(&down)) * 0.25;
+            let luma_edge = (luma(&left) + luma(&right) + luma(&up) + luma(&down)) * 0.25;
             let luma_corner =
                 (luma(&up_left) + luma(&up_right) + luma(&down_left) + luma(&down_right)) * 0.25;
 
@@ -214,8 +213,9 @@ pub fn rcas(image: &RgbaImage, sharpness: f32) -> RgbaImage {
             let weight = (range * 2.0).clamp(0.0, 1.0).powi(2);
 
             let mut result = [0u8; 4];
-            for channel in 0..4 {
-                let neighbours = left.0[channel] as f32 + right.0[channel] as f32
+            for (channel, slot) in result.iter_mut().enumerate() {
+                let neighbours = left.0[channel] as f32
+                    + right.0[channel] as f32
                     + up.0[channel] as f32
                     + down.0[channel] as f32;
                 let average = neighbours * 0.25;
@@ -226,12 +226,19 @@ pub fn rcas(image: &RgbaImage, sharpness: f32) -> RgbaImage {
                 let mut low = center.0[channel];
                 let mut high = center.0[channel];
                 for neighbour in [
-                    &left, &right, &up, &down, &up_left, &up_right, &down_left, &down_right,
+                    &left,
+                    &right,
+                    &up,
+                    &down,
+                    &up_left,
+                    &up_right,
+                    &down_left,
+                    &down_right,
                 ] {
                     low = low.min(neighbour.0[channel]);
                     high = high.max(neighbour.0[channel]);
                 }
-                result[channel] = sharpened.round().clamp(low as f32, high as f32) as u8;
+                *slot = sharpened.round().clamp(low as f32, high as f32) as u8;
             }
             out.put_pixel(x, y, Rgba(result));
         }

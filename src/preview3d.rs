@@ -181,7 +181,14 @@ fn quad_of(face: &ModelFace) -> Option<Quad> {
 }
 
 /// Render a mesh with an orthographic projection.
-pub fn render(mesh: &Mesh, texture: &RgbaImage, width: u32, height: u32, yaw: f32, pitch: f32) -> RgbaImage {
+pub fn render(
+    mesh: &Mesh,
+    texture: &RgbaImage,
+    width: u32,
+    height: u32,
+    yaw: f32,
+    pitch: f32,
+) -> RgbaImage {
     let mut image = RgbaImage::new(width, height);
     let mut depth = vec![f32::INFINITY; (width as usize) * (height as usize)];
 
@@ -369,7 +376,10 @@ mod tests {
         let image = render(&mesh, &texture, 128, 128, 0.6, 0.3);
         assert_eq!(image.dimensions(), (128, 128));
         let drawn = image.pixels().filter(|pixel| pixel.0[3] > 0).count();
-        assert!(drawn > 1000, "the model should cover a good part of the image");
+        assert!(
+            drawn > 1000,
+            "the model should cover a good part of the image"
+        );
     }
 
     #[test]

@@ -221,7 +221,10 @@ pub fn convert(legacy: &RgbaImage, model: &ModelFaces) -> Result<RgbaImage, Stri
     // Models without a texture size use the 16×16 block space; a skin is
     // always 64×64.
     let (uv_width, uv_height) = if model.uv_size.0 > 16.0 {
-        (model.uv_size.0.round() as u32, model.uv_size.1.round() as u32)
+        (
+            model.uv_size.0.round() as u32,
+            model.uv_size.1.round() as u32,
+        )
     } else {
         (64, 64)
     };

@@ -259,7 +259,9 @@ pub fn write_block(
     match_texture: &str,
     tiles: &[RgbaImage],
 ) -> Result<(), String> {
-    let tile_names: Vec<String> = (0..tiles.len()).map(|index| format!("{name}_{index}")).collect();
+    let tile_names: Vec<String> = (0..tiles.len())
+        .map(|index| format!("{name}_{index}"))
+        .collect();
 
     for folder in CTM_FOLDERS {
         let dir = out_dir.join(folder);
@@ -330,8 +332,14 @@ mod tests {
 
     #[test]
     fn corners_refine_the_tile() {
-        assert_eq!(tile_index([true, true, true, false], [true, false, false, false]), 4);
-        assert_eq!(tile_index([true, false, true, false], [false, true, false, false]), 5);
+        assert_eq!(
+            tile_index([true, true, true, false], [true, false, false, false]),
+            4
+        );
+        assert_eq!(
+            tile_index([true, false, true, false], [false, true, false, false]),
+            5
+        );
     }
 
     #[test]
@@ -359,12 +367,27 @@ mod tests {
     #[test]
     fn composes_a_sheet_of_47_tiles() {
         let mut block = BlockFaces::default();
-        block.insert("north", RgbaImage::from_pixel(16, 16, Rgba([10, 10, 10, 255])));
-        block.insert("south", RgbaImage::from_pixel(16, 16, Rgba([20, 20, 20, 255])));
-        block.insert("east", RgbaImage::from_pixel(16, 16, Rgba([30, 30, 30, 255])));
-        block.insert("west", RgbaImage::from_pixel(16, 16, Rgba([40, 40, 40, 255])));
+        block.insert(
+            "north",
+            RgbaImage::from_pixel(16, 16, Rgba([10, 10, 10, 255])),
+        );
+        block.insert(
+            "south",
+            RgbaImage::from_pixel(16, 16, Rgba([20, 20, 20, 255])),
+        );
+        block.insert(
+            "east",
+            RgbaImage::from_pixel(16, 16, Rgba([30, 30, 30, 255])),
+        );
+        block.insert(
+            "west",
+            RgbaImage::from_pixel(16, 16, Rgba([40, 40, 40, 255])),
+        );
         block.insert("up", RgbaImage::from_pixel(16, 16, Rgba([50, 50, 50, 255])));
-        block.insert("down", RgbaImage::from_pixel(16, 16, Rgba([60, 60, 60, 255])));
+        block.insert(
+            "down",
+            RgbaImage::from_pixel(16, 16, Rgba([60, 60, 60, 255])),
+        );
 
         let tiles = compose_tiles(&block);
         assert_eq!(tiles.len(), CTM_TILES);

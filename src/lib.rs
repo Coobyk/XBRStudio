@@ -1,8 +1,8 @@
 pub mod cache;
 pub mod config;
 pub mod ctm;
-pub mod java;
 pub mod jar;
+pub mod java;
 pub mod model;
 pub mod pack;
 pub mod preview3d;

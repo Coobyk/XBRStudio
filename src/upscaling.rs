@@ -145,17 +145,18 @@ pub fn sharpen(image: &RgbaImage, amount: f32) -> RgbaImage {
                     let sy = (y as i64 + dy).clamp(0, height as i64 - 1) as u32;
                     let weight = if dx == 0 && dy == 0 { 4.0 } else { 1.0 };
                     let sample = image.get_pixel(sx, sy);
-                    for channel in 0..4 {
-                        blurred[channel] += sample.0[channel] as f32 * weight;
+                    for (channel, value) in blurred.iter_mut().enumerate() {
+                        *value += sample.0[channel] as f32 * weight;
                     }
                     weight_sum += weight;
                 }
             }
             let mut result = [0u8; 4];
-            for channel in 0..4 {
+            for (channel, slot) in result.iter_mut().enumerate() {
                 let average = blurred[channel] / weight_sum;
-                let value = center.0[channel] as f32 + amount * (center.0[channel] as f32 - average);
-                result[channel] = value.round().clamp(0.0, 255.0) as u8;
+                let value =
+                    center.0[channel] as f32 + amount * (center.0[channel] as f32 - average);
+                *slot = value.round().clamp(0.0, 255.0) as u8;
             }
             out.put_pixel(x, y, Rgba(result));
         }
@@ -354,18 +355,18 @@ fn corner_pixel(
         Corner::TopLeft | Corner::TopRight => Edge::Top,
         Corner::BottomLeft | Corner::BottomRight => Edge::Bottom,
     };
-    if let Some((name, n_edge, rev)) = neighbor_edge(&face.face, primary_edge) {
-        if let Some(neighbor) = group.get(name) {
-            return Some(sample_edge(
-                source,
-                &neighbor.rect,
-                n_edge,
-                rev,
-                i,
-                w.max(1),
-                depth,
-            ));
-        }
+    if let Some((name, n_edge, rev)) = neighbor_edge(&face.face, primary_edge)
+        && let Some(neighbor) = group.get(name)
+    {
+        return Some(sample_edge(
+            source,
+            &neighbor.rect,
+            n_edge,
+            rev,
+            i,
+            w.max(1),
+            depth,
+        ));
     }
     let (secondary_edge, secondary_i) = match corner {
         Corner::TopLeft => (Edge::Left, 0),
@@ -373,18 +374,18 @@ fn corner_pixel(
         Corner::BottomLeft => (Edge::Left, h.saturating_sub(1) as i32),
         Corner::BottomRight => (Edge::Right, h.saturating_sub(1) as i32),
     };
-    if let Some((name, n_edge, rev)) = neighbor_edge(&face.face, secondary_edge) {
-        if let Some(neighbor) = group.get(name) {
-            return Some(sample_edge(
-                source,
-                &neighbor.rect,
-                n_edge,
-                rev,
-                secondary_i,
-                h.max(1),
-                depth,
-            ));
-        }
+    if let Some((name, n_edge, rev)) = neighbor_edge(&face.face, secondary_edge)
+        && let Some(neighbor) = group.get(name)
+    {
+        return Some(sample_edge(
+            source,
+            &neighbor.rect,
+            n_edge,
+            rev,
+            secondary_i,
+            h.max(1),
+            depth,
+        ));
     }
     None
 }
@@ -693,10 +694,10 @@ mod tests {
             },
             face: "north".into(),
             group: 0,
-        origin: None,
-        size: None,
-part: None,
-}
+            origin: None,
+            size: None,
+            part: None,
+        }
     }
 
     /// Box-UV fixture: cube with dx=dy=dz=2, uv(0,0) on an 8×4 image where
@@ -720,60 +721,60 @@ part: None,
                 rect: rect(2, 0, 2, 2),
                 face: "down".into(),
                 group: 0,
-            origin: None,
-            size: None,
-part: None,
-},
+                origin: None,
+                size: None,
+                part: None,
+            },
             ModelFace {
                 texture: String::new(),
                 rect: rect(4, 0, 2, 2),
                 face: "up".into(),
                 group: 0,
-            origin: None,
-            size: None,
-part: None,
-},
+                origin: None,
+                size: None,
+                part: None,
+            },
             ModelFace {
                 texture: String::new(),
                 rect: rect(4, 2, 2, 2),
                 face: "east".into(),
                 group: 0,
-            origin: None,
-            size: None,
-part: None,
-},
+                origin: None,
+                size: None,
+                part: None,
+            },
             ModelFace {
                 texture: String::new(),
                 rect: rect(2, 2, 2, 2),
                 face: "north".into(),
                 group: 0,
-            origin: None,
-            size: None,
-part: None,
-},
+                origin: None,
+                size: None,
+                part: None,
+            },
             ModelFace {
                 texture: String::new(),
                 rect: rect(0, 2, 2, 2),
                 face: "west".into(),
                 group: 0,
-            origin: None,
-            size: None,
-part: None,
-},
+                origin: None,
+                size: None,
+                part: None,
+            },
             ModelFace {
                 texture: String::new(),
                 rect: rect(6, 2, 2, 2),
                 face: "south".into(),
                 group: 0,
-            origin: None,
-            size: None,
-part: None,
-},
+                origin: None,
+                size: None,
+                part: None,
+            },
         ];
         (image, faces)
     }
 
-    fn group_map<'a>(faces: &'a [ModelFace]) -> HashMap<&'a str, &'a ModelFace> {
+    fn group_map(faces: &[ModelFace]) -> HashMap<&str, &ModelFace> {
         faces
             .iter()
             .map(|face| (face.face.as_str(), face))
@@ -782,14 +783,8 @@ part: None,
 
     #[test]
     fn validates_factor() {
-        assert!(
-            UpscaleConfig::new(1, false).validate()
-            .is_err()
-        );
-        assert!(
-            UpscaleConfig::new(6, true).validate()
-            .is_ok()
-        );
+        assert!(UpscaleConfig::new(1, false).validate().is_err());
+        assert!(UpscaleConfig::new(6, true).validate().is_ok());
     }
 
     #[test]
@@ -937,12 +932,7 @@ part: None,
         let stitched = upscale_image(&image, Some(&faces), &config).unwrap();
         assert_eq!(stitched.dimensions(), (32, 16));
 
-        let plain = upscale_image(
-            &image,
-            None,
-            &UpscaleConfig::new(4, false),
-        )
-        .unwrap();
+        let plain = upscale_image(&image, None, &UpscaleConfig::new(4, false)).unwrap();
         // down occupies dest x8..15, y0..7 — its border rows/columns must use
         // neighbor context, so the stitched output differs from plain xBRZ
         // somewhere inside that box.
@@ -1000,10 +990,10 @@ part: None,
             },
             face: "west".into(),
             group: 0,
-        origin: None,
-        size: None,
-part: None,
-};
+            origin: None,
+            size: None,
+            part: None,
+        };
         let north = ModelFace {
             texture: String::new(),
             rect: FaceRect {
@@ -1014,10 +1004,10 @@ part: None,
             },
             face: "north".into(),
             group: 0,
-        origin: None,
-        size: None,
-part: None,
-};
+            origin: None,
+            size: None,
+            part: None,
+        };
         let group: HashMap<&str, &ModelFace> =
             [("west", &west), ("north", &north)].into_iter().collect();
         let tile = build_padded_tile(&image, &west, &group, 1);
@@ -1051,10 +1041,10 @@ part: None,
             },
             face: "north".into(),
             group: 0,
-        origin: None,
-        size: None,
-part: None,
-};
+            origin: None,
+            size: None,
+            part: None,
+        };
         let group: HashMap<&str, &ModelFace> = [("north", &north)].into_iter().collect();
         let tile = build_padded_tile(&image, &north, &group, 1);
         // Top border must stay empty even though the atlas row above is pink.

@@ -390,13 +390,7 @@ fn collect_entity_faces_named(
 
     for child in &part.children {
         let name = child.name.clone();
-        collect_entity_faces_named(
-            child,
-            textures,
-            out,
-            group_counter,
-            Some(name.as_str()),
-        );
+        collect_entity_faces_named(child, textures, out, group_counter, Some(name.as_str()));
     }
 }
 
@@ -680,8 +674,8 @@ mod tests {
                     group: 0,
                     origin: None,
                     size: None,
-                part: None,
-},
+                    part: None,
+                },
                 ModelFace {
                     texture: String::new(),
                     rect: FaceRect {
@@ -694,8 +688,8 @@ mod tests {
                     group: 1,
                     origin: None,
                     size: None,
-                part: None,
-},
+                    part: None,
+                },
             ],
             uv_size: (16.0, 16.0),
         };
@@ -721,8 +715,8 @@ mod tests {
                 group: 0,
                 origin: None,
                 size: None,
-            part: None,
-}],
+                part: None,
+            }],
             uv_size: (64.0, 64.0),
         };
         let image = RgbaImage::new(32, 32);
@@ -889,8 +883,8 @@ mod tests {
             group: 0,
             origin: None,
             size: None,
-        part: None,
-};
+            part: None,
+        };
         let mut same = full.clone();
         same.face = "east".into();
         assert!(!is_atlas_layout(&[full.clone(), same]));
