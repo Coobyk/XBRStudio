@@ -1,0 +1,718 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>XBR Studio · 3D preview</title>
+<style>
+  :root {
+    --bg: #101216;
+    --panel: #171a20;
+    --line: #262b34;
+    --text: #e8ecf3;
+    --dim: #8a93a3;
+    --accent: #5eead4;
+    --danger: #f87171;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    padding-top: max(8px, env(safe-area-inset-top));
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    z-index: 2;
+  }
+  .brand {
+    font-weight: 700;
+    letter-spacing: .04em;
+    white-space: nowrap;
+    color: var(--accent);
+  }
+  .brand span { color: var(--dim); font-weight: 500; }
+  .picker { flex: 1; min-width: 0; }
+  #search {
+    width: 100%;
+    padding: 7px 10px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    outline: none;
+  }
+  #search:focus { border-color: var(--accent); }
+  .nav { display: flex; align-items: center; gap: 4px; }
+  .nav button { padding: 7px 9px; font-size: 16px; line-height: 1; font-weight: 700; }
+  #pos {
+    font-size: 12px;
+    color: var(--dim);
+    min-width: 54px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .actions { display: flex; gap: 8px; }
+  button {
+    padding: 7px 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--panel);
+    color: var(--text);
+    font-size: 13px;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+  button:hover { border-color: var(--dim); }
+  button.on { background: var(--accent); border-color: var(--accent); color: #062019; font-weight: 600; }
+  main { position: relative; flex: 1; min-height: 0; }
+  #cv {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    touch-action: none;
+    background:
+      radial-gradient(1200px 700px at 50% 35%, #1a2029 0%, var(--bg) 70%);
+    cursor: grab;
+  }
+  #cv:active { cursor: grabbing; }
+  #badge {
+    position: absolute;
+    left: 12px;
+    bottom: 12px;
+    max-width: min(70vw, 520px);
+    padding: 6px 10px;
+    background: rgba(16, 18, 22, .82);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    font-size: 12px;
+    color: var(--dim);
+    pointer-events: none;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #badge b { color: var(--text); font-weight: 600; }
+  #hint {
+    position: absolute;
+    right: 12px;
+    bottom: 12px;
+    font-size: 11px;
+    color: var(--dim);
+    opacity: .75;
+    pointer-events: none;
+    text-align: right;
+  }
+  #status {
+    position: absolute;
+    left: 50%;
+    top: 14px;
+    transform: translateX(-50%);
+    padding: 7px 14px;
+    background: rgba(16, 18, 22, .88);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    font-size: 13px;
+    color: var(--dim);
+    pointer-events: none;
+    transition: opacity .2s;
+    max-width: 90vw;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #status:empty { opacity: 0; }
+  #status.error { color: var(--danger); border-color: var(--danger); white-space: normal; }
+  @media (max-width: 560px) {
+    #hint { display: none; }
+    .brand { display: none; }
+    button { padding: 7px 8px; }
+    #pos { min-width: 46px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">XBR<span>·preview3d</span></div>
+  <div class="picker">
+    <input id="search" list="options" autocomplete="off" spellcheck="false"
+           placeholder="Search entity texture…">
+    <datalist id="options"></datalist>
+  </div>
+  <div class="nav">
+    <button id="prev" title="Previous model (← arrow key)">‹</button>
+    <span id="pos" title="Position in the model list"></span>
+    <button id="next" title="Next model (→ arrow key)">›</button>
+  </div>
+  <div class="actions">
+    <button id="ab" title="Toggle the original (nearest) texture">Original</button>
+    <button id="reset" title="Reset the camera">Reset</button>
+  </div>
+</header>
+<main>
+  <canvas id="cv"></canvas>
+  <div id="status"></div>
+  <div id="badge"></div>
+  <div id="hint">drag to orbit · scroll / pinch to zoom · ←/→ next &amp; previous · double-click resets</div>
+</main>
+<script>
+'use strict';
+window.__INDEX__ = /*__INDEX__*/null;
+
+const cv = document.getElementById('cv');
+const statusEl = document.getElementById('status');
+const badgeEl = document.getElementById('badge');
+const searchEl = document.getElementById('search');
+const optionsEl = document.getElementById('options');
+const abBtn = document.getElementById('ab');
+const resetBtn = document.getElementById('reset');
+const prevBtn = document.getElementById('prev');
+const nextBtn = document.getElementById('next');
+const posEl = document.getElementById('pos');
+
+const gl = cv.getContext('webgl', { antialias: true, alpha: true });
+if (!gl) {
+  statusEl.textContent = 'WebGL is not available in this browser.';
+  statusEl.className = 'error';
+  throw new Error('no webgl');
+}
+
+function setStatus(text, isError) {
+  statusEl.textContent = text || '';
+  statusEl.className = isError ? 'error' : '';
+}
+
+function mIdent() {
+  return new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+}
+function mMul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      let s = 0;
+      for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+      o[c * 4 + r] = s;
+    }
+  }
+  return o;
+}
+function mTrans(x, y, z) {
+  const m = mIdent();
+  m[12] = x; m[13] = y; m[14] = z;
+  return m;
+}
+function mRotX(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return new Float32Array([1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1]);
+}
+function mRotY(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return new Float32Array([c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1]);
+}
+function mRotZ(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return new Float32Array([c, s, 0, 0, -s, c, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+}
+function mPerspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2);
+  const nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0
+  ]);
+}
+
+function evalNum(value) {
+  if (typeof value === 'number') return isFinite(value) ? value : 0;
+  if (typeof value !== 'string') return 0;
+  const raw = value.trim();
+  if (!raw) return 0;
+  let s = raw
+    .replace(/\(float\)\s*/g, '')
+    .replace(/Math\.(PI|E|SQRT2|SQRT1_2)/g, (m) => String(Math[m.slice(5)]))
+    .replace(/\b(\d+\.\d+|\d+)F\b/g, '$1')
+    .replace(/\blong\b/g, '');
+  s = s.replace(
+    /[A-Za-z_$][\w$]*(?:\s*\.[\w$]+)*(?:\s*\([^()]*\))?(?:\s*\[[^\]]*\])*/g,
+    '0'
+  );
+  try {
+    const n = Function('"use strict"; return (' + s + ');')();
+    if (typeof n === 'number' && isFinite(n)) return n;
+  } catch (e) { /* fall through */ }
+  const first = raw.match(/-?\d+(?:\.\d+)?/);
+  return first ? parseFloat(first[0]) : 0;
+}
+
+function inflateOf(deform) {
+  if (deform === null || deform === undefined) return 0;
+  if (typeof deform === 'number') return Math.abs(deform) <= 4 ? deform : 0;
+  const s = String(deform);
+  const m = s.match(/extend\(\s*(-?\d+(?:\.\d+)?)F?\s*\)/);
+  if (m) return parseFloat(m[1]);
+  const n = s.match(/^-?\d+(?:\.\d+)?F?$/);
+  if (n) {
+    const v = parseFloat(s);
+    return Math.abs(v) <= 4 ? v : 0;
+  }
+  return 0;
+}
+
+function buildMesh(modelJson, uvSize, frame) {
+  const pos = [], uv = [], nrm = [];
+  const bmin = [Infinity, Infinity, Infinity];
+  const bmax = [-Infinity, -Infinity, -Infinity];
+  const [uw, uh] = uvSize;
+  const [fx, fy, fw, fh] = frame;
+
+  function norm(tu, tv) {
+    return [fx + (tu / uw) * fw, fy + (tv / uh) * fh];
+  }
+
+  function corner(M, c) {
+    const x = M[0] * c[0] + M[4] * c[1] + M[8] * c[2] + M[12];
+    const y = M[1] * c[0] + M[5] * c[1] + M[9] * c[2] + M[13];
+    const z = M[2] * c[0] + M[6] * c[1] + M[10] * c[2] + M[14];
+    const fy = -y;
+    if (x < bmin[0]) bmin[0] = x;
+    if (fy < bmin[1]) bmin[1] = fy;
+    if (z < bmin[2]) bmin[2] = z;
+    if (x > bmax[0]) bmax[0] = x;
+    if (fy > bmax[1]) bmax[1] = fy;
+    if (z > bmax[2]) bmax[2] = z;
+    return [x, fy, z];
+  }
+
+  function quad(M, n, corners) {
+    const order = [0, 1, 2, 0, 2, 3];
+    const pts = corners.map((c) => corner(M, [c[0], c[1], c[2]]));
+    const uvs = corners.map((c) => norm(c[3], c[4]));
+    for (const i of order) {
+      pos.push(pts[i][0], pts[i][1], pts[i][2]);
+      uv.push(uvs[i][0], uvs[i][1]);
+      nrm.push(n[0], -n[1], n[2]);
+    }
+  }
+
+  function cube(M, part) {
+    const size = part.size || [0, 0, 0];
+    const org = part.origin || [0, 0, 0];
+    const inf = inflateOf(part.deform);
+    const dx = size[0], dy = size[1], dz = size[2];
+    const [x0, y0, z0] = [org[0] - inf, org[1] - inf, org[2] - inf];
+    const [x1, y1, z1] = [org[0] + dx + inf, org[1] + dy + inf, org[2] + dz + inf];
+    const u = Array.isArray(part.uv) ? part.uv[0] : 0;
+    const v = Array.isArray(part.uv) ? part.uv[1] : 0;
+    const U0 = u, U1 = u + dz, U2 = u + dz + dx, U3 = u + dz + dx + dz;
+    const V0 = v, V1 = v + dz, V2 = v + dz + dy;
+
+    if (dx > 0 && dz > 0) {
+      quad(M, [0, -1, 0], [[x0, y0, z1, U1, V0], [x1, y0, z1, U2, V0], [x1, y0, z0, U2, V1], [x0, y0, z0, U1, V1]]);
+      quad(M, [0, 1, 0], [[x0, y1, z1, U2, V0], [x1, y1, z1, U2 + dx, V0], [x1, y1, z0, U2 + dx, V1], [x0, y1, z0, U2, V1]]);
+    }
+    if (dy > 0 && dz > 0) {
+      quad(M, [-1, 0, 0], [[x0, y0, z0, U1, V1], [x0, y0, z1, U0, V1], [x0, y1, z1, U0, V2], [x0, y1, z0, U1, V2]]);
+      quad(M, [1, 0, 0], [[x1, y0, z0, U2, V1], [x1, y0, z1, U3, V1], [x1, y1, z1, U3, V2], [x1, y1, z0, U2, V2]]);
+    }
+    if (dy > 0 && dx > 0) {
+      quad(M, [0, 0, -1], [[x0, y0, z0, U1, V1], [x1, y0, z0, U2, V1], [x1, y1, z0, U2, V2], [x0, y1, z0, U1, V2]]);
+      quad(M, [0, 0, 1], [[x1, y0, z1, U3, V1], [x0, y0, z1, U3 + dx, V1], [x0, y1, z1, U3 + dx, V2], [x1, y1, z1, U3, V2]]);
+    }
+  }
+
+  function walk(parts, parent) {
+    for (const part of parts || []) {
+      const tr = part.translation || [0, 0, 0];
+      const rot = part.rotation || [0, 0, 0];
+      let M = mMul(parent, mTrans(evalNum(tr[0]), evalNum(tr[1]), evalNum(tr[2])));
+      M = mMul(M, mRotZ(evalNum(rot[2])));
+      M = mMul(M, mRotY(evalNum(rot[1])));
+      M = mMul(M, mRotX(evalNum(rot[0])));
+      for (const one of part.cubes || []) cube(M, one);
+      walk(part.children, M);
+    }
+  }
+
+  walk(modelJson.parts, mIdent());
+
+  return {
+    count: pos.length / 3,
+    pos: new Float32Array(pos),
+    uv: new Float32Array(uv),
+    nrm: new Float32Array(nrm),
+    center: [(bmin[0] + bmax[0]) / 2, (bmin[1] + bmax[1]) / 2, (bmin[2] + bmax[2]) / 2],
+    radius: Math.max(0.5, 0.5 * Math.hypot(bmax[0] - bmin[0], bmax[1] - bmin[1], bmax[2] - bmin[2]))
+  };
+}
+
+const VS = [
+  'attribute vec3 aPos;',
+  'attribute vec2 aUV;',
+  'attribute vec3 aNrm;',
+  'uniform mat4 uMVP;',
+  'uniform mat3 uNM;',
+  'varying vec2 vUV;',
+  'varying vec3 vN;',
+  'void main() {',
+  '  vUV = aUV;',
+  '  vN = uNM * aNrm;',
+  '  gl_Position = uMVP * vec4(aPos, 1.0);',
+  '}'
+].join('\n');
+
+const FS = [
+  'precision mediump float;',
+  'uniform sampler2D uTex;',
+  'varying vec2 vUV;',
+  'varying vec3 vN;',
+  'void main() {',
+  '  vec4 c = texture2D(uTex, vUV);',
+  '  if (c.a < 0.02) discard;',
+  '  vec3 n = normalize(vN);',
+  '  vec3 l = normalize(vec3(0.3, 0.55, 0.78));',
+  '  float d = max(dot(n, l), 0.0);',
+  '  float li = 0.52 + 0.48 * d;',
+  '  gl_FragColor = vec4(c.rgb * li, c.a);',
+  '}'
+].join('\n');
+
+function compile(type, src) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, src);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(shader) || 'shader compile failed');
+  }
+  return shader;
+}
+
+const program = gl.createProgram();
+gl.attachShader(program, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(program, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(program);
+if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+  throw new Error(gl.getProgramInfoLog(program) || 'program link failed');
+}
+gl.useProgram(program);
+
+const loc = {
+  pos: gl.getAttribLocation(program, 'aPos'),
+  uv: gl.getAttribLocation(program, 'aUV'),
+  nrm: gl.getAttribLocation(program, 'aNrm'),
+  mvp: gl.getUniformLocation(program, 'uMVP'),
+  nm: gl.getUniformLocation(program, 'uNM'),
+  tex: gl.getUniformLocation(program, 'uTex')
+};
+gl.enableVertexAttribArray(loc.pos);
+gl.enableVertexAttribArray(loc.uv);
+gl.enableVertexAttribArray(loc.nrm);
+
+const buffer = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+const stride = 32;
+gl.vertexAttribPointer(loc.pos, 3, gl.FLOAT, false, stride, 0);
+gl.vertexAttribPointer(loc.uv, 2, gl.FLOAT, false, stride, 12);
+gl.vertexAttribPointer(loc.nrm, 3, gl.FLOAT, false, stride, 20);
+
+function makeTexture() {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  return tex;
+}
+const texU = makeTexture();
+const texO = makeTexture();
+
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.BLEND);
+gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+gl.clearColor(0, 0, 0, 0);
+
+const cam = { yaw: 0, pitch: 0, dist: 4, base: 4 };
+let mesh = null;
+let usingOriginal = false;
+
+function fitCamera() {
+  if (!mesh) return;
+  cam.base = (mesh.radius / Math.tan(0.35)) * 1.15;
+  cam.dist = cam.base;
+  cam.yaw = Math.PI;
+  cam.pitch = 0.42;
+}
+
+function uploadImage(tex, img) {
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+}
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.round(cv.clientWidth * dpr));
+  const h = Math.max(1, Math.round(cv.clientHeight * dpr));
+  if (cv.width !== w || cv.height !== h) {
+    cv.width = w;
+    cv.height = h;
+    gl.viewport(0, 0, w, h);
+  }
+}
+
+function render() {
+  resize();
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  if (mesh) {
+    const aspect = cv.width / Math.max(1, cv.height);
+    const proj = mPerspective(0.7, aspect, Math.max(0.01, mesh.radius * 0.02), mesh.radius * 40);
+    let view = mTrans(-mesh.center[0], -mesh.center[1], -mesh.center[2]);
+    view = mMul(mRotY(cam.yaw), view);
+    view = mMul(mRotX(cam.pitch), view);
+    view = mMul(mTrans(0, 0, -cam.dist), view);
+    const mvp = mMul(proj, view);
+    const nm = new Float32Array([
+      view[0], view[1], view[2],
+      view[4], view[5], view[6],
+      view[8], view[9], view[10]
+    ]);
+    gl.uniformMatrix4fv(loc.mvp, false, mvp);
+    gl.uniformMatrix3fv(loc.nm, false, nm);
+    gl.bindTexture(gl.TEXTURE_2D, usingOriginal ? texO : texU);
+    gl.uniform1i(loc.tex, 0);
+    gl.bufferData(gl.ARRAY_BUFFER, mesh.data, gl.STATIC_DRAW);
+    gl.drawArrays(gl.TRIANGLES, 0, mesh.count);
+  }
+  requestAnimationFrame(render);
+}
+
+function buildInterleaved(source) {
+  const n = source.count;
+  const data = new Float32Array(n * 5);
+  for (let i = 0; i < n; i++) {
+    data[i * 5] = source.pos[i * 3];
+    data[i * 5 + 1] = source.pos[i * 3 + 1];
+    data[i * 5 + 2] = source.pos[i * 3 + 2];
+    data[i * 5 + 3] = source.uv[i * 2];
+    data[i * 5 + 4] = source.uv[i * 2 + 1];
+  }
+  const withNormals = new Float32Array(n * 8);
+  for (let i = 0; i < n; i++) {
+    withNormals[i * 8] = data[i * 5];
+    withNormals[i * 8 + 1] = data[i * 5 + 1];
+    withNormals[i * 8 + 2] = data[i * 5 + 2];
+    withNormals[i * 8 + 3] = data[i * 5 + 3];
+    withNormals[i * 8 + 4] = data[i * 5 + 4];
+    withNormals[i * 8 + 5] = source.nrm[i * 3];
+    withNormals[i * 8 + 6] = source.nrm[i * 3 + 1];
+    withNormals[i * 8 + 7] = source.nrm[i * 3 + 2];
+  }
+  return { count: n, data: withNormals, center: source.center, radius: source.radius };
+}
+
+let INDEX = null;
+let pairs = [];
+let current = null;
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('texture failed: ' + src));
+    img.src = src;
+  });
+}
+
+function frameOf(pair) {
+  if (!Array.isArray(pair.frame)) return [0, 0, 1, 1];
+  const [w, h] = pair.orig;
+  const [x, y, fw, fh] = pair.frame;
+  return [x / w, y / h, fw / w, fh / h];
+}
+
+let selectSeq = 0;
+
+function updatePos() {
+  const idx = current ? pairs.indexOf(current) : -1;
+  posEl.textContent = idx >= 0 ? (idx + 1) + '/' + pairs.length : '–';
+}
+
+async function select(pair) {
+  if (!pair) return;
+  const seq = ++selectSeq;
+  current = pair;
+  history.replaceState(null, '', '#' + encodeURIComponent(pair.id));
+  searchEl.value = pair.name;
+  updatePos();
+  setStatus('loading ' + pair.name + '…');
+  try {
+    const modelJson = INDEX.models[pair.model];
+    if (!modelJson) throw new Error('model JSON missing: ' + pair.model);
+    const ts = modelJson.texture_size;
+    const uvSize = Array.isArray(ts) && ts.length >= 2 && ts[0]
+      ? [Number(ts[0]), Number(ts[1])]
+      : [pair.orig[0], pair.orig[1]];
+    const [iu, io] = await Promise.all([loadImage(pair.u), loadImage(pair.o)]);
+    if (seq !== selectSeq) return; // a newer selection superseded this load
+    mesh = buildInterleaved(buildMesh(modelJson, uvSize, frameOf(pair)));
+    uploadImage(texU, iu);
+    uploadImage(texO, io);
+    fitCamera();
+    usingOriginal = false;
+    abBtn.classList.remove('on');
+    setStatus('');
+    const modelName = String(pair.model).split('/').pop();
+    badgeEl.innerHTML =
+      '<b>' + escapeHtml(pair.name) + '</b> · ' +
+      pair.orig[0] + '×' + pair.orig[1] + ' → ×' +
+      (iu.naturalWidth / pair.orig[0]) + ' · ' + escapeHtml(modelName);
+  } catch (error) {
+    if (seq !== selectSeq) return;
+    mesh = null;
+    setStatus(String(error && error.message || error), true);
+    badgeEl.textContent = '';
+  }
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"]/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'
+  })[c]);
+}
+
+function pickByName(query) {
+  const q = query.trim().toLowerCase();
+  if (!q) return null;
+  return pairs.find((p) => p.name.toLowerCase() === q || p.id.toLowerCase() === q)
+    || pairs.find((p) => p.id.toLowerCase().includes(q))
+    || null;
+}
+
+searchEl.addEventListener('change', () => {
+  const pick = pickByName(searchEl.value);
+  if (pick) select(pick);
+});
+searchEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    const pick = pickByName(searchEl.value);
+    if (pick) select(pick);
+    else if (current) searchEl.value = current.name;
+    searchEl.blur();
+  }
+});
+
+abBtn.addEventListener('click', () => {
+  usingOriginal = !usingOriginal;
+  abBtn.classList.toggle('on', usingOriginal);
+  abBtn.textContent = usingOriginal ? 'Upscaled' : 'Original';
+});
+resetBtn.addEventListener('click', fitCamera);
+
+function step(delta) {
+  if (!pairs.length) return;
+  const idx = current ? pairs.indexOf(current) : -1;
+  const target = ((idx < 0 ? 0 : idx) + delta + pairs.length) % pairs.length;
+  select(pairs[target]);
+}
+prevBtn.addEventListener('click', () => step(-1));
+nextBtn.addEventListener('click', () => step(1));
+window.addEventListener('keydown', (e) => {
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+  e.preventDefault();
+  step(e.key === 'ArrowRight' ? 1 : -1);
+});
+
+const pointers = new Map();
+let lastTap = 0;
+
+cv.addEventListener('pointerdown', (e) => {
+  cv.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, t: performance.now() });
+});
+cv.addEventListener('pointermove', (e) => {
+  const p = pointers.get(e.pointerId);
+  if (!p) return;
+  const dx = e.clientX - p.x;
+  const dy = e.clientY - p.y;
+  p.x = e.clientX;
+  p.y = e.clientY;
+  if (pointers.size === 1) {
+    cam.yaw += dx * 0.01;
+    cam.pitch = Math.max(-1.45, Math.min(1.45, cam.pitch + dy * 0.01));
+  } else if (pointers.size === 2) {
+    const list = [...pointers.values()];
+    const dist = Math.hypot(list[0].x - list[1].x, list[0].y - list[1].y);
+    if (p.prevPinch && dist > 0) cam.dist *= p.prevPinch / dist;
+    p.prevPinch = dist;
+    for (const other of pointers.values()) other.prevPinch = dist;
+  }
+});
+function endPointer(e) {
+  const p = pointers.get(e.pointerId);
+  pointers.delete(e.pointerId);
+  for (const other of pointers.values()) delete other.prevPinch;
+  if (!p) return;
+  const moved = Math.hypot(e.clientX - p.sx, e.clientY - p.sy);
+  const held = performance.now() - p.t;
+  if (moved < 12 && held < 400) {
+    const now = performance.now();
+    if (now - lastTap < 320) fitCamera();
+    lastTap = now;
+  }
+}
+cv.addEventListener('pointerup', endPointer);
+cv.addEventListener('pointercancel', endPointer);
+cv.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  cam.dist = Math.max(cam.base * 0.12, Math.min(cam.base * 14, cam.dist * Math.exp(e.deltaY * 0.0012)));
+}, { passive: false });
+cv.addEventListener('dblclick', fitCamera);
+
+async function init() {
+  try {
+    INDEX = window.__INDEX__ || await (await fetch('/api/index')).json();
+  } catch (error) {
+    setStatus('cannot load index: ' + error.message, true);
+    return;
+  }
+  pairs = (INDEX.pairs || []).slice().sort((a, b) =>
+    a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  if (!pairs.length) {
+    setStatus('no texture/model pairs found', true);
+    return;
+  }
+  for (const pair of pairs) {
+    const option = document.createElement('option');
+    option.value = pair.name;
+    option.label = pair.id;
+    optionsEl.appendChild(option);
+  }
+  const hash = decodeURIComponent(location.hash.replace(/^#/, ''));
+  const initial = pairs.find((p) => p.id === hash) || pickByName(hash) || pairs[0];
+  select(initial);
+}
+
+render();
+init();
+</script>
+</body>
+</html>

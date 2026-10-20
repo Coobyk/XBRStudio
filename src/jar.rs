@@ -118,6 +118,10 @@ struct EntityModel {
     pkg_dirs: Vec<String>,
     /// Lowercased method name, e.g. `createbodylayer`.
     method: String,
+    /// Raw model JSON, kept for the 3D preview tool.
+    raw: Value,
+    /// Model file path relative to the model directory (posix separators).
+    source: String,
 }
 
 struct ProcessOutcome {
@@ -773,13 +777,31 @@ fn signal_score(model: &EntityModel, ctx: &TextureCtx) -> i64 {
         signal -= 10_000;
     }
 
-    let method_chestboat = method.contains("chestboat");
+    let method_chestboat = method.contains("chestboat") || method.contains("chestraft");
     if ctx.family == "chestboat" {
         if method_chestboat {
             signal += 1500;
         }
     } else if method_chestboat {
         signal -= 1500;
+    }
+    // Vanilla bamboo boats/chest boats use the raft mesh, not the boat mesh.
+    if (ctx.family == "boat" || ctx.family == "chestboat") && ctx.stripped == "bamboo" {
+        if key == "raft" {
+            signal += 4000;
+        } else if key == "boat" {
+            signal -= 4000;
+        }
+    }
+    // Layer methods win their own texture token: breeze_eyes.png →
+    // createEyesLayer, breeze_wind.png → createWindLayer, creaking_eyes → …
+    if ctx.family == key
+        && !ctx.stripped.is_empty()
+        && let Some(rest) = ctx.stripped.strip_prefix(key)
+        && !rest.is_empty()
+        && method.contains(rest)
+    {
+        signal += 900;
     }
     if method.contains("pose") {
         signal -= 500;
@@ -860,10 +882,61 @@ fn best_model_for<'a>(
     ctx: &TextureCtx,
     image: (u32, u32),
 ) -> Option<&'a EntityModel> {
-    models
+    let strict = models
         .iter()
-        .filter(|model| signal_score(model, ctx) >= MIN_SIGNAL)
-        .max_by_key(|model| score_model(model, ctx, image))
+        .filter(|model| model_eligible(model, ctx))
+        .max_by_key(|model| score_model(model, ctx, image));
+    // Keep every texture paired: if the strict rules reject everything (odd
+    // alias layout), fall back to plain signal-threshold scoring rather than
+    // dropping it.
+    strict.or_else(|| {
+        models
+            .iter()
+            .filter(|model| signal_score(model, ctx) >= MIN_SIGNAL)
+            .max_by_key(|model| score_model(model, ctx, image))
+    })
+}
+
+/// Pairing eligibility, stricter than the raw signal threshold. A wrong
+/// pairing is glaring in 3D (wrong proportions, stray hat/nose cubes) and
+/// bakes damaged textures (stitching clears texels the wrong model never
+/// covers), so:
+///
+/// 1. Baby models never serve an adult texture (the signal gate allows it when
+///    the package and texture_size bonuses outweigh the age penalty).
+/// 2. Families with an explicit alias target (`zombie` → `humanoid`,
+///    `horse` → `abstractequine`, …) reject models that are neither that
+///    target nor name-equivalent to the texture. This stops
+///    `ZombieVillagerModel` from stealing `zombie.png`/`husk.png` via its
+///    `monster/zombie` package path and its `texture_size: [64, 64]` match.
+fn model_eligible(model: &EntityModel, ctx: &TextureCtx) -> bool {
+    if signal_score(model, ctx) < MIN_SIGNAL {
+        return false;
+    }
+    let key = model.key.as_str();
+    let base = model.base_key.as_str();
+    let model_baby = key.starts_with("baby") || model.method.contains("baby");
+    // Equipment encodes age in the subdir (`humanoid_baby`) and is already
+    // scored precisely by `signal_score`; the age ban only applies to skins.
+    if !ctx.is_equipment && model_baby && !ctx.wants_baby {
+        return false;
+    }
+    let aliases = alias_targets(&ctx.family);
+    if aliases.is_empty() || aliases.contains(&key) {
+        return true;
+    }
+    // Name-equivalent to the texture: exact keys, prefixes the texture grew
+    // around (drowned_outer_layer → drowned), or babies of them.
+    key == ctx.family
+        || base == ctx.family
+        || key == ctx.stripped
+        || key == ctx.stem
+        || base == ctx.stripped
+        || ctx.stripped.starts_with(key)
+        || ctx.stripped.starts_with(base)
+        || (model_baby
+            && ctx.wants_baby
+            && model.pkg_dirs.iter().any(|dir| dir == &ctx.family))
 }
 
 fn load_entity_models(model_dir: &Path) -> Vec<EntityModel> {
@@ -908,6 +981,11 @@ fn load_entity_models(model_dir: &Path) -> Vec<EntityModel> {
             .take(fqcn.split('.').count().saturating_sub(1))
             .map(normalize_key)
             .collect::<Vec<_>>();
+        let source = path
+            .strip_prefix(model_dir)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
         models.push(EntityModel {
             faces: parsed,
             has_texture_size,
@@ -915,10 +993,162 @@ fn load_entity_models(model_dir: &Path) -> Vec<EntityModel> {
             key,
             pkg_dirs,
             method,
+            raw: value,
+            source,
         });
     }
 
     models
+}
+
+/// A texture↔model pairing for the 3D preview tool.
+#[derive(Debug, Clone)]
+pub struct PreviewPair {
+    /// Texture path relative to `textures/` (e.g. `entity/cow/cow_temperate.png`).
+    pub texture_rel: String,
+    /// Preview id: `texture_rel` without the `.png` suffix.
+    pub id: String,
+    /// Texture file stem, shown in the picker.
+    pub name: String,
+    /// Key into [`PreviewData::models`].
+    pub model_source: String,
+    /// Original texture size in pixels.
+    pub orig_size: (u32, u32),
+    /// First animation frame in original-texture pixels, when animated.
+    pub frame: Option<(u32, u32, u32, u32)>,
+}
+
+/// Everything the preview tool needs: pairs, raw model JSONs, original PNGs.
+#[derive(Debug)]
+pub struct PreviewData {
+    pub pairs: Vec<PreviewPair>,
+    pub models: HashMap<String, Value>,
+    /// Original PNG bytes keyed by [`PreviewPair::id`].
+    pub orig_textures: HashMap<String, Vec<u8>>,
+}
+
+/// Pair every upscaled entity texture under `textures_root` with its best
+/// model from `model_dir`, loading original textures and mcmeta from the jar.
+pub fn load_preview_pairs(
+    model_dir: &Path,
+    textures_root: &Path,
+    jar_path: &Path,
+) -> Result<PreviewData, String> {
+    let entity_models = load_entity_models(model_dir);
+    if entity_models.is_empty() {
+        return Err(format!(
+            "no entity models found under {}",
+            model_dir.display()
+        ));
+    }
+
+    let file = File::open(jar_path)
+        .map_err(|error| format!("cannot open {}: {error}", jar_path.display()))?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|error| format!("cannot read jar: {error}"))?;
+    let mut index_by_name: HashMap<String, usize> = HashMap::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        let name = archive
+            .by_index(index)
+            .map_err(|error| format!("cannot list jar entry: {error}"))?
+            .name()
+            .to_string();
+        index_by_name.insert(name, index);
+    }
+
+    let entity_root = textures_root.join("entity");
+    let mut pngs = Vec::new();
+    collect_png_files(&entity_root, &mut pngs);
+    pngs.sort();
+
+    let mut pairs = Vec::new();
+    let mut model_jsons: HashMap<String, Value> = HashMap::new();
+    let mut orig_textures = HashMap::new();
+
+    for path in pngs {
+        let Ok(rel) = path.strip_prefix(textures_root) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let Some(ctx) = texture_ctx(&rel) else {
+            continue;
+        };
+        let entry_name = format!("{TEXTURE_ROOT}{rel}");
+        let Some(&index) = index_by_name.get(&entry_name) else {
+            continue;
+        };
+        let Ok(orig_bytes) = read_entry(&mut archive, index) else {
+            continue;
+        };
+        let Ok((orig_w, orig_h)) =
+            image::load_from_memory(&orig_bytes).map(|image| (image.width(), image.height()))
+        else {
+            continue;
+        };
+        if orig_w == 0 || orig_h == 0 {
+            continue;
+        }
+        let Some(model) = best_model_for(&entity_models, &ctx, (orig_w, orig_h)) else {
+            continue;
+        };
+
+        let frame = index_by_name
+            .get(&format!("{entry_name}.mcmeta"))
+            .copied()
+            .and_then(|mcmeta_index| read_entry(&mut archive, mcmeta_index).ok())
+            .and_then(|mcmeta| serde_json::from_slice::<Value>(&mcmeta).ok())
+            .and_then(|value| value.get("animation").cloned())
+            .filter(|animation| !animation.is_null())
+            .map(|animation| {
+                let (frame_w, frame_h) = animation_frame_size(orig_w, orig_h, &animation);
+                (0, 0, frame_w, frame_h)
+            });
+
+        let id = entry_id(&rel);
+        let name = id.rsplit('/').next().unwrap_or(&id).to_string();
+        model_jsons
+            .entry(model.source.clone())
+            .or_insert_with(|| model.raw.clone());
+        orig_textures.insert(id.clone(), orig_bytes);
+        pairs.push(PreviewPair {
+            texture_rel: rel,
+            id,
+            name,
+            model_source: model.source.clone(),
+            orig_size: (orig_w, orig_h),
+            frame,
+        });
+    }
+
+    if pairs.is_empty() {
+        return Err("no upscaled entity textures paired with a model".into());
+    }
+    Ok(PreviewData {
+        pairs,
+        models: model_jsons,
+        orig_textures,
+    })
+}
+
+fn entry_id(relative_png: &str) -> String {
+    relative_png
+        .strip_suffix(".png")
+        .unwrap_or(relative_png)
+        .to_string()
+}
+
+fn collect_png_files(directory: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_png_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "png") {
+            out.push(path);
+        }
+    }
 }
 
 /// Relative `block/<stem>` from a texture path under `textures/`, if any.
@@ -967,7 +1197,11 @@ fn load_block_models(
 
     let resolved = resolve_block_models(&raw);
     let mut by_stem: HashMap<String, Vec<(String, ModelFaces)>> = HashMap::new();
-    for (key, value) in &resolved {
+    // Sorted iteration: HashMap order would randomize the merge order per run,
+    // and merged faces are pasted in that order (overlapping rects differ).
+    let mut resolved_entries: Vec<(&String, &Value)> = resolved.iter().collect();
+    resolved_entries.sort_by(|a, b| a.0.cmp(b.0));
+    for (key, value) in resolved_entries {
         let Ok(parsed) = parse_model(value) else {
             continue;
         };
@@ -984,7 +1218,15 @@ fn load_block_models(
 
     by_stem
         .into_iter()
-        .filter_map(|(stem, models)| {
+        .filter_map(|(stem, mut models)| {
+            // Deterministic merge order: non-atlas (full-cube) models paste
+            // first so the atlas-layout faces they overlap win the pixel,
+            // then by model key. Without this the pack changes every run.
+            models.sort_by(|a, b| {
+                is_atlas_layout(&a.1.faces)
+                    .cmp(&is_atlas_layout(&b.1.faces))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
             // Prefer the same-name model (lantern.png → lantern.json) when it
             // exists; otherwise merge every model that references the texture.
             let chosen: Vec<ModelFaces> = models
@@ -1340,6 +1582,8 @@ mod tests {
             key: key.into(),
             pkg_dirs: pkg.iter().map(|dir| normalize_key(dir)).collect(),
             method: method.into(),
+            raw: Value::Null,
+            source: String::new(),
         }
     }
 

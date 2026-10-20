@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use image::RgbaImage;
 use serde::Deserialize;
@@ -53,7 +53,9 @@ struct RawModel {
 #[derive(Deserialize)]
 struct RawElement {
     #[serde(default)]
-    faces: HashMap<String, RawFace>,
+    // BTreeMap: face order must be deterministic — faces sharing a rect are
+    // pasted in iteration order, so a HashMap here changes output pixels per run.
+    faces: BTreeMap<String, RawFace>,
 }
 
 #[derive(Deserialize)]
@@ -376,7 +378,7 @@ fn extract_textures(root: &Value) -> HashMap<String, String> {
 }
 
 fn first_texture_reference(textures: &HashMap<String, String>) -> Option<String> {
-    textures.keys().next().map(|value| value.to_string())
+    textures.keys().min().map(|value| value.to_string())
 }
 
 /// Concrete `block/<name>` stems referenced by a model's texture map
@@ -384,8 +386,10 @@ fn first_texture_reference(textures: &HashMap<String, String>) -> Option<String>
 pub fn block_texture_stems(textures: &HashMap<String, String>) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for value in textures.values() {
-        collect_block_stems(textures, value, &mut out, &mut seen, 0);
+    let mut keys: Vec<&String> = textures.keys().collect();
+    keys.sort_unstable();
+    for key in keys {
+        collect_block_stems(textures, &textures[key], &mut out, &mut seen, 0);
     }
     out
 }
