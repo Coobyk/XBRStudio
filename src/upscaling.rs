@@ -2,25 +2,165 @@ use std::collections::{HashMap, HashSet};
 
 use image::{Rgba, RgbaImage};
 use rayon::prelude::*;
-use xbrz::scale_rgba;
 
 use crate::model::{FaceRect, ModelFace};
+use crate::scalers::{Algorithm, AlphaMode};
 
 pub const MAX_FACTOR: u32 = 6;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UpscaleConfig {
     pub factor: u32,
     pub stitch_faces: bool,
+    /// Upscaling algorithm.
+    pub algorithm: Algorithm,
+    /// How transparent texels are handled.
+    pub alpha_mode: AlphaMode,
+    /// Extra unsharp amount applied after scaling (0 disables it).
+    pub sharpen: f32,
+}
+
+impl Default for UpscaleConfig {
+    fn default() -> Self {
+        Self {
+            factor: 4,
+            stitch_faces: false,
+            algorithm: Algorithm::Xbrz,
+            alpha_mode: AlphaMode::Straight,
+            sharpen: 0.0,
+        }
+    }
 }
 
 impl UpscaleConfig {
+    pub fn new(factor: u32, stitch_faces: bool) -> Self {
+        Self {
+            factor,
+            stitch_faces,
+            ..Self::default()
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if !(2..=MAX_FACTOR).contains(&self.factor) {
             return Err(format!("factor must be between 2 and {MAX_FACTOR}"));
         }
+        if !(0.0..=1.0).contains(&self.sharpen) {
+            return Err("sharpen must be between 0.0 and 1.0".to_string());
+        }
         Ok(())
     }
+}
+
+/// Scale one image with the configured algorithm, alpha handling and
+/// sharpening. This is the primitive every other path builds on.
+pub fn scale_plain(image: &RgbaImage, config: &UpscaleConfig) -> Result<RgbaImage, String> {
+    let premultiplied = matches!(config.alpha_mode, AlphaMode::Premultiplied)
+        || (matches!(config.alpha_mode, AlphaMode::Masked)
+            && matches!(config.algorithm, Algorithm::Xbrz | Algorithm::Nearest));
+
+    let source = if premultiplied {
+        premultiply(image)
+    } else {
+        image.clone()
+    };
+
+    let mut scaled = match config.algorithm {
+        Algorithm::Xbrz | Algorithm::Nearest => config.algorithm.scale(&source, config.factor)?,
+        Algorithm::Fsr => crate::scalers::fsr::scale_fsr(&source, config.factor),
+        Algorithm::Lanczos3 | Algorithm::Bicubic => {
+            let kernel: &dyn crate::scalers::resample::Kernel = match config.algorithm {
+                Algorithm::Lanczos3 => &crate::scalers::resample::Lanczos3,
+                _ => &crate::scalers::resample::CatmullRom,
+            };
+            let handling = match config.alpha_mode {
+                AlphaMode::Straight => crate::scalers::resample::AlphaHandling::Straight,
+                AlphaMode::Premultiplied => crate::scalers::resample::AlphaHandling::Premultiplied,
+                AlphaMode::Masked => crate::scalers::resample::AlphaHandling::Masked,
+            };
+            crate::scalers::resample::scale_windowed(&source, config.factor, kernel, handling)
+        }
+    };
+
+    if premultiplied {
+        scaled = unpremultiply(&scaled);
+    }
+
+    if config.sharpen > 0.0 {
+        scaled = sharpen(&scaled, config.sharpen);
+    }
+
+    Ok(scaled)
+}
+
+/// Multiply the colour channels by alpha.
+pub fn premultiply(image: &RgbaImage) -> RgbaImage {
+    let mut out = RgbaImage::new(image.width(), image.height());
+    for (source, target) in image.pixels().zip(out.pixels_mut()) {
+        let alpha = source.0[3] as u32;
+        target.0 = [
+            ((source.0[0] as u32 * alpha) / 255) as u8,
+            ((source.0[1] as u32 * alpha) / 255) as u8,
+            ((source.0[2] as u32 * alpha) / 255) as u8,
+            source.0[3],
+        ];
+    }
+    out
+}
+
+/// Undo [`premultiply`], keeping fully transparent texels black.
+pub fn unpremultiply(image: &RgbaImage) -> RgbaImage {
+    let mut out = RgbaImage::new(image.width(), image.height());
+    for (source, target) in image.pixels().zip(out.pixels_mut()) {
+        let alpha = source.0[3];
+        if alpha == 0 {
+            target.0 = [0, 0, 0, 0];
+            continue;
+        }
+        target.0 = [
+            ((source.0[0] as u32 * 255) / alpha as u32).min(255) as u8,
+            ((source.0[1] as u32 * 255) / alpha as u32).min(255) as u8,
+            ((source.0[2] as u32 * 255) / alpha as u32).min(255) as u8,
+            alpha,
+        ];
+    }
+    out
+}
+
+/// Unsharp mask with a 3×3 kernel.
+pub fn sharpen(image: &RgbaImage, amount: f32) -> RgbaImage {
+    if amount <= 0.0 {
+        return image.clone();
+    }
+    let (width, height) = image.dimensions();
+    let mut out = RgbaImage::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            let center = image.get_pixel(x, y);
+            let mut blurred = [0.0f32; 4];
+            let mut weight_sum = 0.0f32;
+            for dy in -1i64..=1 {
+                for dx in -1i64..=1 {
+                    let sx = (x as i64 + dx).clamp(0, width as i64 - 1) as u32;
+                    let sy = (y as i64 + dy).clamp(0, height as i64 - 1) as u32;
+                    let weight = if dx == 0 && dy == 0 { 4.0 } else { 1.0 };
+                    let sample = image.get_pixel(sx, sy);
+                    for channel in 0..4 {
+                        blurred[channel] += sample.0[channel] as f32 * weight;
+                    }
+                    weight_sum += weight;
+                }
+            }
+            let mut result = [0u8; 4];
+            for channel in 0..4 {
+                let average = blurred[channel] / weight_sum;
+                let value = center.0[channel] as f32 + amount * (center.0[channel] as f32 - average);
+                result[channel] = value.round().clamp(0.0, 255.0) as u8;
+            }
+            out.put_pixel(x, y, Rgba(result));
+        }
+    }
+    out
 }
 
 /// Add a 1-pixel self-tiling border: edges copy the opposite edge, corners
@@ -41,18 +181,15 @@ pub(crate) fn wrap_tile(image: &RgbaImage) -> RgbaImage {
 /// Upscale with a wrapped 1px border so tiled textures (blocks) get correct
 /// edge context, then shave `factor` output pixels (the scaled border) off
 /// every side. Output dimensions match a plain upscale exactly.
-pub fn upscale_wrapped(image: &RgbaImage, factor: u32) -> Result<RgbaImage, String> {
-    let config = UpscaleConfig {
-        factor,
-        stitch_faces: false,
-    };
+pub fn upscale_wrapped(image: &RgbaImage, config: &UpscaleConfig) -> Result<RgbaImage, String> {
     config.validate()?;
     if image.width() == 0 || image.height() == 0 {
         return Err("cannot wrap a zero-size texture".into());
     }
 
     let padded = wrap_tile(image);
-    let upscaled = upscale_image(&padded, None, &config)?;
+    let upscaled = upscale_image(&padded, None, config)?;
+    let factor = config.factor;
     let (width, height) = (image.width() * factor, image.height() * factor);
     Ok(image::imageops::crop_imm(&upscaled, factor, factor, width, height).to_image())
 }
@@ -68,16 +205,10 @@ pub fn upscale_image(
     let (output_width, output_height) =
         (source_width * config.factor, source_height * config.factor);
 
-    if !config.stitch_faces {
-        let scaled = scale_rgba(
-            image.as_raw(),
-            source_width as usize,
-            source_height as usize,
-            config.factor as usize,
-        );
+    let _ = (source_width, source_height, output_width, output_height);
 
-        return RgbaImage::from_raw(output_width, output_height, scaled)
-            .ok_or_else(|| "xBRZ produced an invalid image buffer".to_string());
+    if !config.stitch_faces {
+        return scale_plain(image, config);
     }
 
     let faces = faces.ok_or_else(|| "stitching requires model faces".to_string())?;
@@ -85,7 +216,7 @@ pub fn upscale_image(
         return Err("stitching requires at least one model face".to_string());
     }
 
-    upscale_box_faces(image, faces, config.factor)
+    upscale_box_faces(image, faces, config)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -458,19 +589,14 @@ pub fn face_border_tile(
 fn upscale_box_faces(
     image: &RgbaImage,
     faces: &[ModelFace],
-    factor: u32,
+    config: &UpscaleConfig,
 ) -> Result<RgbaImage, String> {
+    let factor = config.factor;
     let (source_width, source_height) = (image.width(), image.height());
-    let (output_width, output_height) = (source_width * factor, source_height * factor);
+    let output_width = source_width * factor;
+    let output_height = source_height * factor;
 
-    let mut output = upscale_image(
-        image,
-        None,
-        &UpscaleConfig {
-            factor,
-            stitch_faces: false,
-        },
-    )?;
+    let mut output = scale_plain(image, config)?;
 
     let mut boxes: HashMap<u32, Vec<usize>> = HashMap::new();
     for (index, face) in faces.iter().enumerate() {
@@ -507,14 +633,7 @@ fn upscale_box_faces(
                 .get(&face.group)
                 .ok_or_else(|| "missing face group".to_string())?;
             let padded = build_padded_tile(image, face, group, 1);
-            let upscaled = upscale_image(
-                &padded,
-                None,
-                &UpscaleConfig {
-                    factor,
-                    stitch_faces: false,
-                },
-            )?;
+            let upscaled = scale_plain(&padded, config)?;
             let cropped = image::imageops::crop_imm(
                 &upscaled,
                 factor,
@@ -643,19 +762,11 @@ mod tests {
     #[test]
     fn validates_factor() {
         assert!(
-            UpscaleConfig {
-                factor: 1,
-                stitch_faces: false
-            }
-            .validate()
+            UpscaleConfig::new(1, false).validate()
             .is_err()
         );
         assert!(
-            UpscaleConfig {
-                factor: 6,
-                stitch_faces: true
-            }
-            .validate()
+            UpscaleConfig::new(6, true).validate()
             .is_ok()
         );
     }
@@ -752,10 +863,7 @@ mod tests {
     #[test]
     fn upscales_dimensions() {
         let image = RgbaImage::from_pixel(4, 4, Rgba([10, 20, 30, 255]));
-        let config = UpscaleConfig {
-            factor: 4,
-            stitch_faces: false,
-        };
+        let config = UpscaleConfig::new(4, false);
         let output = upscale_image(&image, None, &config).unwrap();
         assert_eq!(output.dimensions(), (16, 16));
     }
@@ -792,11 +900,11 @@ mod tests {
     #[test]
     fn upscale_wrapped_matches_plain_dimensions() {
         let image = RgbaImage::from_pixel(4, 4, Rgba([10, 20, 30, 255]));
-        let output = upscale_wrapped(&image, 4).unwrap();
+        let output = upscale_wrapped(&image, &UpscaleConfig::new(4, false)).unwrap();
         assert_eq!(output.dimensions(), (16, 16));
 
         let single = RgbaImage::from_pixel(1, 1, Rgba([1, 2, 3, 4]));
-        let output = upscale_wrapped(&single, 2).unwrap();
+        let output = upscale_wrapped(&single, &UpscaleConfig::new(2, false)).unwrap();
         assert_eq!(output.dimensions(), (2, 2));
         assert_eq!(*output.get_pixel(0, 0), Rgba([1, 2, 3, 4]));
     }
@@ -804,20 +912,14 @@ mod tests {
     #[test]
     fn box_faces_stitch_dims_and_border_context() {
         let (image, faces) = box_fixture();
-        let config = UpscaleConfig {
-            factor: 4,
-            stitch_faces: true,
-        };
+        let config = UpscaleConfig::new(4, true);
         let stitched = upscale_image(&image, Some(&faces), &config).unwrap();
         assert_eq!(stitched.dimensions(), (32, 16));
 
         let plain = upscale_image(
             &image,
             None,
-            &UpscaleConfig {
-                factor: 4,
-                stitch_faces: false,
-            },
+            &UpscaleConfig::new(4, false),
         )
         .unwrap();
         // down occupies dest x8..15, y0..7 — its border rows/columns must use

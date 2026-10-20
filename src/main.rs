@@ -2,8 +2,11 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
+use xbrstudio::config::Config;
 use xbrstudio::jar::{self, BatchOptions, BatchProgress};
 use xbrstudio::model::{self, load_model};
+use xbrstudio::pack::{self, PackOptions};
+use xbrstudio::scalers::{Algorithm, AlphaMode};
 use xbrstudio::upscaling::{self, UpscaleConfig, upscale_image};
 
 #[derive(Parser, Debug)]
@@ -37,6 +40,18 @@ struct Cli {
     #[arg(short, long, default_value_t = 4)]
     factor: u32,
 
+    /// Upscaling algorithm.
+    #[arg(long, value_enum, default_value_t = Algorithm::Xbrz)]
+    algorithm: Algorithm,
+
+    /// How transparent texels are handled while scaling.
+    #[arg(long, value_enum, default_value_t = AlphaMode::Straight)]
+    alpha: AlphaMode,
+
+    /// Extra sharpening after scaling (0.0-1.0).
+    #[arg(long, default_value_t = 0.0)]
+    sharpen: f32,
+
     /// Upscale without model-face stitching.
     #[arg(long)]
     no_stitch: bool,
@@ -44,6 +59,42 @@ struct Cli {
     /// Skip the 1px self-tiling border wrap for block textures and the beacon beam.
     #[arg(long)]
     no_wrap: bool,
+
+    /// Also write the resource pack as a zip file.
+    #[arg(long)]
+    zip: Option<PathBuf>,
+
+    /// Install the pack zip into the Minecraft resourcepacks folder.
+    #[arg(long)]
+    install: bool,
+
+    /// `pack_format` written into pack.mcmeta.
+    #[arg(long)]
+    pack_format: Option<i64>,
+
+    /// Description written into pack.mcmeta.
+    #[arg(long)]
+    pack_description: Option<String>,
+
+    /// OptiFine mipmap levels written into pack.mcmeta.
+    #[arg(long)]
+    mipmap_levels: Option<u32>,
+
+    /// Only process textures whose path contains this substring.
+    #[arg(long)]
+    only: Option<String>,
+
+    /// Skip textures that are already up to date.
+    #[arg(long)]
+    resume: bool,
+
+    /// Configuration file (default: ./xbrstudio.toml or the user config dir).
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Print more detail about what is going on.
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 fn main() {
@@ -56,15 +107,69 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
+    let config = Config::load(cli.config.as_deref())?;
+
+    let factor = if cli.factor == 4 {
+        config.factor.unwrap_or(cli.factor)
+    } else {
+        cli.factor
+    };
+    let algorithm = config.algorithm.unwrap_or(cli.algorithm);
+    let alpha = config.alpha.unwrap_or(cli.alpha);
+    let sharpen = if cli.sharpen == 0.0 {
+        config.sharpen.unwrap_or(cli.sharpen)
+    } else {
+        cli.sharpen
+    };
+    let stitch = config.stitch.unwrap_or(true) && !cli.no_stitch;
+    let wrap = config.wrap.unwrap_or(true) && !cli.no_wrap;
+    let model_dir = cli.models.clone().or_else(|| {
+        config
+            .models
+            .as_ref()
+            .map(|path| PathBuf::from(path))
+            .or_else(jar::default_model_dir)
+    });
+
     match (&cli.input, &cli.jar) {
         (Some(_), Some(_)) => Err("pass either a texture path or --jar, not both".into()),
         (None, None) => Err("provide a texture path, or --jar <file.jar>".into()),
-        (Some(input), None) => run_single(&cli, input),
-        (None, Some(jar)) => run_batch(&cli, jar),
+        (Some(input), None) => run_single(
+            &cli,
+            input,
+            factor,
+            algorithm,
+            alpha,
+            sharpen,
+            stitch,
+            wrap,
+        ),
+        (None, Some(jar_path)) => run_batch(
+            &cli,
+            jar_path,
+            factor,
+            algorithm,
+            alpha,
+            sharpen,
+            stitch,
+            wrap,
+            model_dir,
+            &config,
+        ),
     }
 }
 
-fn run_single(cli: &Cli, input: &Path) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+fn run_single(
+    cli: &Cli,
+    input: &Path,
+    factor: u32,
+    algorithm: Algorithm,
+    alpha: AlphaMode,
+    sharpen: f32,
+    stitch: bool,
+    wrap: bool,
+) -> Result<(), String> {
     let source = image::open(input)
         .map_err(|error| format!("cannot read {}: {error}", input.display()))?
         .to_rgba8();
@@ -85,13 +190,16 @@ fn run_single(cli: &Cli, input: &Path) -> Result<(), String> {
     };
 
     let config = UpscaleConfig {
-        factor: cli.factor,
-        stitch_faces: !cli.no_stitch && faces.is_some(),
+        factor,
+        stitch_faces: stitch && faces.is_some(),
+        algorithm,
+        alpha_mode: alpha,
+        sharpen,
     };
 
-    let wrap = !cli.no_wrap && !config.stitch_faces && jar::is_wrap_texture_path(input);
-    let output_image = if wrap {
-        upscaling::upscale_wrapped(&source, cli.factor)?
+    let use_wrap = wrap && !config.stitch_faces && jar::is_wrap_texture_path(input);
+    let output_image = if use_wrap {
+        upscaling::upscale_wrapped(&source, &config)?
     } else {
         upscale_image(
             &source,
@@ -103,12 +211,12 @@ fn run_single(cli: &Cli, input: &Path) -> Result<(), String> {
     let output_path = cli
         .output
         .clone()
-        .unwrap_or_else(|| default_output_path(input, cli.factor));
-    if let Some(parent) = output_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-        }
+        .unwrap_or_else(|| default_output_path(input, factor));
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
 
     output_image
@@ -116,40 +224,66 @@ fn run_single(cli: &Cli, input: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot write {}: {error}", output_path.display()))?;
 
     println!(
-        "{} -> {} ({}x{}, factor {}{})",
+        "{} -> {} ({}x{}, factor {}, {})",
         input.display(),
         output_path.display(),
         output_image.width(),
         output_image.height(),
-        cli.factor,
-        if wrap { ", tiled wrap" } else { "" }
+        factor,
+        algorithm.name()
     );
 
-    if config.stitch_faces {
-        if let Some(faces) = faces {
-            println!(
-                "stitched {} model faces across {} boxes",
-                faces.faces.len(),
-                upscaling::box_count(&faces.faces)
-            );
-        }
+    if config.stitch_faces
+        && let Some(faces) = faces
+    {
+        println!(
+            "stitched {} model faces across {} boxes",
+            faces.faces.len(),
+            upscaling::box_count(&faces.faces)
+        );
     }
 
     Ok(())
 }
 
-fn run_batch(cli: &Cli, jar_path: &Path) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+fn run_batch(
+    cli: &Cli,
+    jar_path: &Path,
+    factor: u32,
+    algorithm: Algorithm,
+    alpha: AlphaMode,
+    sharpen: f32,
+    stitch: bool,
+    wrap: bool,
+    model_dir: Option<PathBuf>,
+    config: &Config,
+) -> Result<(), String> {
     let out_dir = cli.output.clone().unwrap_or_else(|| {
         let stem = jar_path.file_stem().unwrap_or_default().to_string_lossy();
         let parent = jar_path.parent().unwrap_or_else(|| Path::new("."));
-        parent.join(format!("{stem}_x{}", cli.factor))
+        parent.join(format!("{stem}_x{factor}"))
     });
 
+    let pack_options = PackOptions {
+        pack_format: cli.pack_format.or(config.pack_format),
+        description: cli.pack_description.clone().or(config.pack_description.clone()),
+        mipmap_levels: cli.mipmap_levels.or(config.mipmap_levels),
+        min_format: None,
+        max_format: None,
+    };
+
     let opts = BatchOptions {
-        factor: cli.factor,
-        stitch: !cli.no_stitch,
-        model_dir: cli.models.clone(),
-        wrap: !cli.no_wrap,
+        factor,
+        stitch,
+        model_dir,
+        wrap,
+        algorithm,
+        alpha_mode: alpha,
+        sharpen,
+        only: cli.only.clone(),
+        resume: cli.resume || config.resume.unwrap_or(false),
+        pack: pack_options,
     };
 
     let report = jar::upscale_jar(jar_path, &out_dir, &opts, |progress| match progress {
@@ -170,13 +304,17 @@ fn run_batch(cli: &Cli, jar_path: &Path) -> Result<(), String> {
     })?;
 
     println!(
-        "{} -> {} ({} textures upscaled, {} colormaps copied, factor {})",
+        "{} -> {} ({} textures upscaled, {} colormaps copied, factor {}, {})",
         jar_path.display(),
         out_dir.display(),
         report.upscaled,
         report.copied,
-        cli.factor
+        factor,
+        algorithm.name()
     );
+    if report.skipped > 0 {
+        println!("  textures skipped (already up to date): {}", report.skipped);
+    }
     if report.wrapped > 0 {
         println!("  textures with tiled wrap: {}", report.wrapped);
     }
@@ -214,7 +352,31 @@ fn run_batch(cli: &Cli, jar_path: &Path) -> Result<(), String> {
         }
     }
 
+    if let Some(zip_path) = &cli.zip {
+        pack::zip_directory(&out_dir, zip_path)?;
+        println!("wrote {}", zip_path.display());
+    }
+
+    if cli.install {
+        let zip_path = cli
+            .zip
+            .clone()
+            .unwrap_or_else(|| out_dir.join(format!("{stem}.zip", stem = out_dir_name(&out_dir))));
+        if !zip_path.is_file() {
+            pack::zip_directory(&out_dir, &zip_path)?;
+        }
+        let installed = pack::install_pack(&zip_path)?;
+        println!("installed {}", installed.display());
+    }
+
     Ok(())
+}
+
+fn out_dir_name(out_dir: &Path) -> String {
+    out_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "pack".to_string())
 }
 
 fn default_output_path(input: &std::path::Path, factor: u32) -> PathBuf {

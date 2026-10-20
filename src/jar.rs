@@ -13,6 +13,9 @@ use crate::model::{
     ModelFaces, block_texture_stems, is_atlas_layout, merge_model_faces, parse_model,
     resolve_block_models, scale_model_faces_to_image,
 };
+use crate::cache::{Cache, fingerprint, settings_fingerprint};
+use crate::pack::PackOptions;
+use crate::scalers::{Algorithm, AlphaMode};
 use crate::upscaling::{UpscaleConfig, upscale_image, upscale_wrapped};
 
 pub const TEXTURE_ROOT: &str = "assets/minecraft/textures/";
@@ -35,6 +38,8 @@ pub struct BatchReport {
     /// Non-animated `entity/` textures that found no model (or lost too many
     /// faces to the clip gate), sorted by path.
     pub unmatched_entity: Vec<String>,
+    /// Textures that were already up to date and were skipped.
+    pub skipped: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +71,18 @@ pub struct BatchOptions {
     /// Upscale `textures/block/**` and the beacon beam with a 1px self-tiling
     /// border so edges get wrap context (border scaled away afterwards).
     pub wrap: bool,
+    /// Upscaling algorithm.
+    pub algorithm: Algorithm,
+    /// How transparent texels are handled.
+    pub alpha_mode: AlphaMode,
+    /// Extra unsharp amount applied after scaling.
+    pub sharpen: f32,
+    /// Only process textures whose path contains this substring.
+    pub only: Option<String>,
+    /// Skip textures that are already up to date.
+    pub resume: bool,
+    /// What ends up in pack.mcmeta.
+    pub pack: PackOptions,
 }
 
 impl Default for BatchOptions {
@@ -75,6 +92,25 @@ impl Default for BatchOptions {
             stitch: true,
             model_dir: None,
             wrap: true,
+            algorithm: Algorithm::Xbrz,
+            alpha_mode: AlphaMode::Straight,
+            sharpen: 0.0,
+            only: None,
+            resume: false,
+            pack: PackOptions::default(),
+        }
+    }
+}
+
+impl BatchOptions {
+    /// The upscale configuration used for one texture.
+    pub fn upscale_config(&self, stitch_faces: bool) -> UpscaleConfig {
+        UpscaleConfig {
+            factor: self.factor,
+            stitch_faces,
+            algorithm: self.algorithm,
+            alpha_mode: self.alpha_mode,
+            sharpen: self.sharpen,
         }
     }
 }
@@ -129,6 +165,8 @@ struct ProcessOutcome {
     stitched: bool,
     wrapped: bool,
     copied: bool,
+    /// The texture was already up to date and was not processed again.
+    skipped: bool,
 }
 
 pub fn default_model_dir() -> Option<PathBuf> {
@@ -168,11 +206,7 @@ pub fn upscale_jar(
     opts: &BatchOptions,
     progress: impl Fn(BatchProgress) + Sync,
 ) -> Result<BatchReport, String> {
-    UpscaleConfig {
-        factor: opts.factor,
-        stitch_faces: false,
-    }
-    .validate()?;
+    opts.upscale_config(false).validate()?;
 
     let file = File::open(jar_path)
         .map_err(|error| format!("cannot open {}: {error}", jar_path.display()))?;
@@ -192,6 +226,9 @@ pub fn upscale_jar(
         }
     }
     textures.sort_by(|a, b| a.1.cmp(&b.1));
+    if let Some(only) = opts.only.as_deref() {
+        textures.retain(|(_, name)| name.contains(only));
+    }
     if textures.is_empty() {
         return Err(format!(
             "no PNG textures found under {TEXTURE_ROOT} in {}",
@@ -239,6 +276,20 @@ pub fn upscale_jar(
         block_models: block_models.len(),
     });
 
+    let settings = settings_fingerprint(
+        opts.factor,
+        opts.algorithm.name(),
+        opts.alpha_mode.name(),
+        opts.sharpen,
+        opts.stitch,
+        opts.wrap,
+    );
+    let cache = if opts.resume {
+        Some(std::sync::Mutex::new(Cache::load(out_dir)))
+    } else {
+        None
+    };
+
     let done = AtomicUsize::new(0);
     let results: Vec<(String, Result<ProcessOutcome, String>)> = jobs
         .par_iter()
@@ -248,15 +299,50 @@ pub fn upscale_jar(
                 .strip_prefix(TEXTURE_ROOT)
                 .unwrap_or(&job.name)
                 .to_string();
-            let outcome = process_one(
-                &job.name,
-                &job.bytes,
-                job.mcmeta.as_deref(),
-                out_dir,
-                opts,
-                &models,
-                &block_models,
-            );
+            let outcome = match &cache {
+                Some(cache) => {
+                    let key = job.name.clone();
+                    let print = fingerprint(&job.bytes, &settings);
+                    let fresh = cache
+                        .lock()
+                        .map(|cache| cache.is_fresh(&key, &print))
+                        .unwrap_or(false);
+                    if fresh {
+                        Ok(ProcessOutcome {
+                            animated: false,
+                            stitched: false,
+                            wrapped: false,
+                            copied: false,
+                            skipped: true,
+                        })
+                    } else {
+                        let result = process_one(
+                            &job.name,
+                            &job.bytes,
+                            job.mcmeta.as_deref(),
+                            out_dir,
+                            opts,
+                            &models,
+                            &block_models,
+                        );
+                        if result.is_ok()
+                            && let Ok(mut cache) = cache.lock()
+                        {
+                            cache.record(&key, &print);
+                        }
+                        result
+                    }
+                }
+                None => process_one(
+                    &job.name,
+                    &job.bytes,
+                    job.mcmeta.as_deref(),
+                    out_dir,
+                    opts,
+                    &models,
+                    &block_models,
+                ),
+            };
             let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
             progress(BatchProgress::Texture {
                 done: completed,
@@ -278,13 +364,16 @@ pub fn upscale_jar(
         entity_models: models.len(),
         block_models: block_models.len(),
         unmatched_entity: Vec::new(),
+        skipped: 0,
     };
 
     for (name, outcome) in results {
         let short = name.strip_prefix(TEXTURE_ROOT).unwrap_or(&name);
         match outcome {
             Ok(outcome) => {
-                if outcome.copied {
+                if outcome.skipped {
+                    report.skipped += 1;
+                } else if outcome.copied {
                     report.copied += 1;
                 } else {
                     report.upscaled += 1;
@@ -309,8 +398,16 @@ pub fn upscale_jar(
         }
     }
 
-    if let Err(error) = write_pack_mcmeta(out_dir, pack_format, opts.factor) {
+    if let Err(error) = write_pack_mcmeta(out_dir, pack_format, opts.factor, &opts.pack) {
         report.errors.push(("pack.mcmeta".into(), error));
+    }
+
+    if let Some(cache) = cache
+        && let Ok(cache) = cache.into_inner()
+    {
+        if let Err(error) = cache.save() {
+            report.errors.push(("cache".into(), error));
+        }
     }
 
     report.errors.sort();
@@ -353,6 +450,7 @@ fn process_one(
             stitched: false,
             wrapped: false,
             copied: true,
+            skipped: false,
         });
     }
 
@@ -384,7 +482,7 @@ fn process_one(
         let value = mcmeta_value.clone().expect("checked above");
         let animation = value.get("animation").expect("checked above");
         let (upscaled, stitched) =
-            upscale_animated(&image, animation, opts.factor, wrap, block_model)?;
+            upscale_animated(&image, animation, &opts.upscale_config(false), wrap, block_model)?;
         if stitched {
             wrap = false;
         }
@@ -419,26 +517,17 @@ fn process_one(
         if stitched {
             wrap = false;
         }
+        let config = opts.upscale_config(stitched);
         let upscaled = if stitched {
             upscale_image(
                 &image,
                 local_model.as_ref().map(|model| model.faces.as_slice()),
-                &UpscaleConfig {
-                    factor: opts.factor,
-                    stitch_faces: true,
-                },
+                &config,
             )?
         } else if wrap {
-            upscale_wrapped(&image, opts.factor)?
+            upscale_wrapped(&image, &config)?
         } else {
-            upscale_image(
-                &image,
-                None,
-                &UpscaleConfig {
-                    factor: opts.factor,
-                    stitch_faces: false,
-                },
-            )?
+            upscale_image(&image, None, &config)?
         };
         (
             upscaled,
@@ -474,16 +563,18 @@ fn process_one(
         stitched,
         wrapped: wrap,
         copied: false,
+        skipped: false,
     })
 }
 
 fn upscale_animated(
     image: &RgbaImage,
     animation: &Value,
-    factor: u32,
+    config: &UpscaleConfig,
     wrap: bool,
     model: Option<&ModelFaces>,
 ) -> Result<(RgbaImage, bool), String> {
+    let factor = config.factor;
     let (_frame_width, frame_height) =
         animation_frame_size(image.width(), image.height(), animation);
     let frame_count = (image.height() / frame_height).max(1);
@@ -502,25 +593,15 @@ fn upscale_animated(
                     return upscale_image(
                         &band,
                         Some(model_faces.faces.as_slice()),
-                        &UpscaleConfig {
-                            factor,
-                            stitch_faces: true,
-                        },
+                        &config,
                     )
                     .map(|image| (image, true));
                 }
             }
             let upscaled = if wrap {
-                upscale_wrapped(&band, factor)
+                upscale_wrapped(&band, config)
             } else {
-                upscale_image(
-                    &band,
-                    None,
-                    &UpscaleConfig {
-                        factor,
-                        stitch_faces: false,
-                    },
-                )
+                upscale_image(&band, None, config)
             };
             upscaled.map(|image| (image, false))
         })
@@ -1274,31 +1355,13 @@ fn read_pack_format(archive: &mut ZipArchive<File>) -> Option<i64> {
     pack.get("resource_major").and_then(Value::as_i64)
 }
 
-fn write_pack_mcmeta(out_dir: &Path, pack_format: Option<i64>, factor: u32) -> Result<(), String> {
-    let path = out_dir.join("pack.mcmeta");
-    if path.exists() {
-        return Ok(());
-    }
-    let description = format!("Upscaled x{factor} by XBR Studio");
-    let value = match pack_format {
-        Some(format) => json!({
-            "pack": {
-                "pack_format": format,
-                "description": description,
-            }
-        }),
-        None => json!({
-            "pack": {
-                "pack_format": 1,
-                "supported_formats": {"min_inclusive": 1, "max_inclusive": 999},
-                "description": description,
-            }
-        }),
-    };
-    let encoded = serde_json::to_vec_pretty(&value)
-        .map_err(|error| format!("encode pack.mcmeta: {error}"))?;
-    std::fs::write(&path, encoded)
-        .map_err(|error| format!("cannot write {}: {error}", path.display()))
+fn write_pack_mcmeta(
+    out_dir: &Path,
+    pack_format: Option<i64>,
+    factor: u32,
+    opts: &PackOptions,
+) -> Result<(), String> {
+    crate::pack::write_pack_mcmeta(out_dir, pack_format, factor, opts)
 }
 
 #[cfg(test)]
@@ -2110,6 +2173,7 @@ mod tests {
             stitch: true,
             model_dir: Some(model_dir),
             wrap: true,
+            ..BatchOptions::default()
         };
 
         let report = upscale_jar(&jar_path, &out_dir, &opts, |_| {}).unwrap();
