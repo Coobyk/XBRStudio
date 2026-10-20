@@ -19,7 +19,8 @@ struct Cli {
     /// Input PNG texture (omit when using --jar).
     input: Option<PathBuf>,
 
-    /// Minecraft client jar: batch-upscale every texture into a resource-pack folder.
+    /// Minecraft client jar, resource pack zip or pack folder: batch-upscale
+    /// every texture into a resource-pack folder.
     #[arg(long)]
     jar: Option<PathBuf>,
 
@@ -310,6 +311,15 @@ fn run_batch(
     config: &Config,
 ) -> Result<(), String> {
     let out_dir = cli.output.clone().unwrap_or_else(|| {
+        if jar_path.is_dir() {
+            let stem = jar_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let parent = jar_path.parent().unwrap_or_else(|| Path::new("."));
+            return parent.join(format!("{stem}_x{factor}"));
+        }
         let stem = jar_path.file_stem().unwrap_or_default().to_string_lossy();
         let parent = jar_path.parent().unwrap_or_else(|| Path::new("."));
         parent.join(format!("{stem}_x{factor}"))
@@ -341,7 +351,7 @@ fn run_batch(
         cancel: None,
     };
 
-    let report = jar::upscale_jar(jar_path, &out_dir, &opts, |progress| match progress {
+    let report = jar::upscale_source(jar_path, &out_dir, &opts, |progress| match progress {
         BatchProgress::Started {
             total,
             entity_models,
