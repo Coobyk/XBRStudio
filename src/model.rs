@@ -33,6 +33,10 @@ pub struct ModelFace {
     /// Cube/element index within the model; neighbors are only looked up
     /// inside this group.
     pub group: u32,
+    /// The corner of the cube the face belongs to (entity models only).
+    pub origin: Option<[f32; 3]>,
+    /// The size of the cube the face belongs to (entity models only).
+    pub size: Option<[f32; 3]>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +88,8 @@ struct RawEntityPart {
 
 #[derive(Deserialize)]
 struct RawEntityCube {
+    #[serde(default)]
+    origin: [f32; 3],
     #[serde(default)]
     size: [f32; 3],
     #[serde(default)]
@@ -140,6 +146,8 @@ fn parse_block_model(root: &Value) -> Result<ModelFaces, String> {
                 },
                 face: face_name,
                 group: element_index as u32,
+                origin: None,
+                size: None,
             });
         }
     }
@@ -355,6 +363,8 @@ fn collect_entity_faces(
                 },
                 face: face_name.into(),
                 group,
+                origin: Some(cube.origin),
+                size: Some(cube.size),
             });
         }
     }
@@ -642,6 +652,8 @@ mod tests {
                     },
                     face: "north".into(),
                     group: 0,
+                    origin: None,
+                    size: None,
                 },
                 ModelFace {
                     texture: String::new(),
@@ -653,6 +665,8 @@ mod tests {
                     },
                     face: "east".into(),
                     group: 1,
+                    origin: None,
+                    size: None,
                 },
             ],
             uv_size: (16.0, 16.0),
@@ -677,6 +691,8 @@ mod tests {
                 },
                 face: "north".into(),
                 group: 0,
+                origin: None,
+                size: None,
             }],
             uv_size: (64.0, 64.0),
         };
@@ -842,6 +858,8 @@ mod tests {
             },
             face: "north".into(),
             group: 0,
+            origin: None,
+            size: None,
         };
         let mut same = full.clone();
         same.face = "east".into();

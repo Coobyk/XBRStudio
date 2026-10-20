@@ -593,13 +593,6 @@ fn pose_values(args: &[String]) -> Vec<Value> {
         .collect()
 }
 
-fn numbers_in(text: &str) -> Vec<f32> {
-    split_args(text)
-        .iter()
-        .filter_map(|arg| parse_number(arg))
-        .collect()
-}
-
 /// Split a comma separated argument list, ignoring commas inside nested
 /// calls, arrays and strings.
 pub fn split_args(text: &str) -> Vec<String> {

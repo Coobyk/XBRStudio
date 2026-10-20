@@ -290,6 +290,7 @@ fn run_batch(
         pack: pack_options,
         connected_textures: cli.connected_textures
             || config.connected_textures.unwrap_or(false),
+        cancel: None,
     };
 
     let report = jar::upscale_jar(jar_path, &out_dir, &opts, |progress| match progress {

@@ -89,6 +89,8 @@ pub struct BatchOptions {
     /// Also write OptiFine connected textures for blocks with several
     /// different faces.
     pub connected_textures: bool,
+    /// Stop the batch when this flag is set.
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for BatchOptions {
@@ -105,6 +107,7 @@ impl Default for BatchOptions {
             resume: false,
             pack: PackOptions::default(),
             connected_textures: false,
+            cancel: None,
         }
     }
 }
@@ -308,6 +311,21 @@ pub fn upscale_jar(
                 .strip_prefix(TEXTURE_ROOT)
                 .unwrap_or(&job.name)
                 .to_string();
+            if let Some(cancel) = &opts.cancel
+                && cancel.load(Ordering::Relaxed)
+            {
+                return (
+                    job.name.clone(),
+                    Ok(ProcessOutcome {
+                        animated: false,
+                        stitched: false,
+                        wrapped: false,
+                        copied: false,
+                        skipped: true,
+                        connected: false,
+                    }),
+                );
+            }
             let outcome = match &cache {
                 Some(cache) => {
                     let key = job.name.clone();
@@ -687,7 +705,7 @@ fn upscale_animated(
     Ok((out, stitched_any))
 }
 
-fn animation_frame_size(width: u32, height: u32, animation: &Value) -> (u32, u32) {
+pub fn animation_frame_size(width: u32, height: u32, animation: &Value) -> (u32, u32) {
     let frame_width = animation
         .get("width")
         .and_then(Value::as_u64)
@@ -1306,6 +1324,75 @@ fn block_texture_stem_for(relative: &str) -> Option<String> {
 /// Load `models/block/*.json` from the jar, resolve parent chains, and index
 /// atlas-like models by block texture stem (merged across models that
 /// reference the same texture).
+/// The names of the block models in a jar, sorted.
+pub fn list_block_models(jar_path: &Path) -> Result<Vec<String>, String> {
+    let file = File::open(jar_path)
+        .map_err(|error| format!("cannot open {}: {error}", jar_path.display()))?;
+    let mut archive = ZipArchive::new(file).map_err(|error| format!("cannot read jar: {error}"))?;
+    let mut names: Vec<String> = Vec::new();
+    for index in 0..archive.len() {
+        let name = archive
+            .by_index(index)
+            .map_err(|error| format!("cannot list jar entry: {error}"))?
+            .name()
+            .to_string();
+        if name.starts_with(BLOCK_MODEL_ROOT) && name.ends_with(".json") {
+            let short = name
+                .trim_end_matches(".json")
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if !short.is_empty() {
+                names.push(short);
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+/// The faces of one block model from a jar, with the parent chain resolved.
+pub fn load_block_model(jar_path: &Path, name: &str) -> Result<ModelFaces, String> {
+    let file = File::open(jar_path)
+        .map_err(|error| format!("cannot open {}: {error}", jar_path.display()))?;
+    let mut archive = ZipArchive::new(file).map_err(|error| format!("cannot read jar: {error}"))?;
+
+    let mut raw: HashMap<String, Value> = HashMap::new();
+    let mut entries: Vec<(String, usize)> = Vec::new();
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|error| format!("cannot list jar entry: {error}"))?;
+        let entry_name = entry.name().to_string();
+        if entry_name.starts_with(BLOCK_MODEL_ROOT) && entry_name.ends_with(".json") {
+            let short = entry_name
+                .trim_end_matches(".json")
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if !short.is_empty() {
+                entries.push((short, index));
+            }
+        }
+    }
+
+    for (short, index) in entries {
+        let bytes = read_entry(&mut archive, index)?;
+        if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+            raw.insert(short, value);
+        }
+    }
+
+    let resolved = resolve_block_models(&raw);
+    let value = resolved
+        .get(name)
+        .ok_or_else(|| format!("no block model named {name}"))?;
+    parse_model(value)
+}
+
 fn load_block_models(
     archive: &mut ZipArchive<File>,
     index_by_name: &HashMap<String, usize>,
@@ -1693,7 +1780,9 @@ mod tests {
                 },
                 face: "top".into(),
                 group: 0,
-            })
+            origin: None,
+            size: None,
+})
             .collect();
         EntityModel {
             faces: crate::model::ModelFaces {

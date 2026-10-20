@@ -5,5 +5,6 @@ pub mod java;
 pub mod jar;
 pub mod model;
 pub mod pack;
+pub mod preview3d;
 pub mod scalers;
 pub mod upscaling;

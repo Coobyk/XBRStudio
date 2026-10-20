@@ -197,7 +197,9 @@ mod tests {
             },
             face: name.into(),
             group: 0,
-        }
+        origin: None,
+        size: None,
+}
     }
 
     #[test]

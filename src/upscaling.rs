@@ -693,7 +693,9 @@ mod tests {
             },
             face: "north".into(),
             group: 0,
-        }
+        origin: None,
+        size: None,
+}
     }
 
     /// Box-UV fixture: cube with dx=dy=dz=2, uv(0,0) on an 8×4 image where
@@ -717,37 +719,49 @@ mod tests {
                 rect: rect(2, 0, 2, 2),
                 face: "down".into(),
                 group: 0,
-            },
+            origin: None,
+            size: None,
+},
             ModelFace {
                 texture: String::new(),
                 rect: rect(4, 0, 2, 2),
                 face: "up".into(),
                 group: 0,
-            },
+            origin: None,
+            size: None,
+},
             ModelFace {
                 texture: String::new(),
                 rect: rect(4, 2, 2, 2),
                 face: "east".into(),
                 group: 0,
-            },
+            origin: None,
+            size: None,
+},
             ModelFace {
                 texture: String::new(),
                 rect: rect(2, 2, 2, 2),
                 face: "north".into(),
                 group: 0,
-            },
+            origin: None,
+            size: None,
+},
             ModelFace {
                 texture: String::new(),
                 rect: rect(0, 2, 2, 2),
                 face: "west".into(),
                 group: 0,
-            },
+            origin: None,
+            size: None,
+},
             ModelFace {
                 texture: String::new(),
                 rect: rect(6, 2, 2, 2),
                 face: "south".into(),
                 group: 0,
-            },
+            origin: None,
+            size: None,
+},
         ];
         (image, faces)
     }
@@ -979,7 +993,9 @@ mod tests {
             },
             face: "west".into(),
             group: 0,
-        };
+        origin: None,
+        size: None,
+};
         let north = ModelFace {
             texture: String::new(),
             rect: FaceRect {
@@ -990,7 +1006,9 @@ mod tests {
             },
             face: "north".into(),
             group: 0,
-        };
+        origin: None,
+        size: None,
+};
         let group: HashMap<&str, &ModelFace> =
             [("west", &west), ("north", &north)].into_iter().collect();
         let tile = build_padded_tile(&image, &west, &group, 1);
@@ -1024,7 +1042,9 @@ mod tests {
             },
             face: "north".into(),
             group: 0,
-        };
+        origin: None,
+        size: None,
+};
         let group: HashMap<&str, &ModelFace> = [("north", &north)].into_iter().collect();
         let tile = build_padded_tile(&image, &north, &group, 1);
         // Top border must stay empty even though the atlas row above is pink.
