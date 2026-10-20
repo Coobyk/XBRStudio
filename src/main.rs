@@ -31,6 +31,10 @@ struct Cli {
     #[arg(long)]
     model: Option<PathBuf>,
 
+    /// Convert a legacy 64x32 skin into the layout of the model.
+    #[arg(long, value_name = "PNG")]
+    convert_skin: Option<PathBuf>,
+
     /// Directory of entity model JSONs used for stitching in --jar mode.
     /// Defaults to models/entity when present.
     #[arg(long)]
@@ -135,6 +139,10 @@ fn run(cli: Cli) -> Result<(), String> {
             .or_else(jar::default_model_dir)
     });
 
+    if let Some(legacy) = &cli.convert_skin {
+        return run_convert_skin(&cli, legacy);
+    }
+
     match (&cli.input, &cli.jar) {
         (Some(_), Some(_)) => Err("pass either a texture path or --jar, not both".into()),
         (None, None) => Err("provide a texture path, or --jar <file.jar>".into()),
@@ -161,6 +169,43 @@ fn run(cli: Cli) -> Result<(), String> {
             &config,
         ),
     }
+}
+
+/// Convert a legacy skin into the layout of an entity model.
+fn run_convert_skin(cli: &Cli, legacy_path: &Path) -> Result<(), String> {
+    let Some(model_path) = &cli.model else {
+        return Err("--convert-skin needs a model: pass --model <model.json>".into());
+    };
+
+    let legacy = image::open(legacy_path)
+        .map_err(|error| format!("cannot read {}: {error}", legacy_path.display()))?
+        .to_rgba8();
+    let model = load_model(model_path)?;
+
+    let modern = xbrstudio::skin::convert(&legacy, &model)?;
+
+    let output_path = cli.output.clone().unwrap_or_else(|| {
+        let stem = legacy_path.file_stem().unwrap_or_default().to_string_lossy();
+        legacy_path.with_file_name(format!("{stem}_modern.png"))
+    });
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+    modern
+        .save(&output_path)
+        .map_err(|error| format!("cannot write {}: {error}", output_path.display()))?;
+
+    println!(
+        "{} -> {} ({}x{})",
+        legacy_path.display(),
+        output_path.display(),
+        modern.width(),
+        modern.height()
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1782,6 +1782,7 @@ mod tests {
                 group: 0,
             origin: None,
             size: None,
+part: None,
 })
             .collect();
         EntityModel {

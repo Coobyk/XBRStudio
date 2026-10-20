@@ -7,4 +7,5 @@ pub mod model;
 pub mod pack;
 pub mod preview3d;
 pub mod scalers;
+pub mod skin;
 pub mod upscaling;

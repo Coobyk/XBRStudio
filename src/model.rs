@@ -37,6 +37,8 @@ pub struct ModelFace {
     pub origin: Option<[f32; 3]>,
     /// The size of the cube the face belongs to (entity models only).
     pub size: Option<[f32; 3]>,
+    /// The name of the part the face belongs to (entity models only).
+    pub part: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +82,8 @@ struct RawEntityModel {
 
 #[derive(Deserialize)]
 struct RawEntityPart {
+    #[serde(default)]
+    name: String,
     #[serde(default)]
     cubes: Vec<RawEntityCube>,
     #[serde(default)]
@@ -148,6 +152,7 @@ fn parse_block_model(root: &Value) -> Result<ModelFaces, String> {
                 group: element_index as u32,
                 origin: None,
                 size: None,
+                part: None,
             });
         }
     }
@@ -320,6 +325,19 @@ fn collect_entity_faces(
     out: &mut Vec<ModelFace>,
     group_counter: &mut u32,
 ) {
+    collect_entity_faces_named(part, textures, out, group_counter, None);
+}
+
+fn collect_entity_faces_named(
+    part: &RawEntityPart,
+    textures: &HashMap<String, String>,
+    out: &mut Vec<ModelFace>,
+    group_counter: &mut u32,
+    parent: Option<&str>,
+) {
+    let part_name = parent
+        .map(|name| name.to_string())
+        .or_else(|| Some(part.name.clone()));
     for cube in &part.cubes {
         let [dx, dy, dz] = cube.size;
         let (u, v) = (cube.uv[0], cube.uv[1]);
@@ -365,12 +383,20 @@ fn collect_entity_faces(
                 group,
                 origin: Some(cube.origin),
                 size: Some(cube.size),
+                part: part_name.clone(),
             });
         }
     }
 
     for child in &part.children {
-        collect_entity_faces(child, textures, out, group_counter);
+        let name = child.name.clone();
+        collect_entity_faces_named(
+            child,
+            textures,
+            out,
+            group_counter,
+            Some(name.as_str()),
+        );
     }
 }
 
@@ -654,7 +680,8 @@ mod tests {
                     group: 0,
                     origin: None,
                     size: None,
-                },
+                part: None,
+},
                 ModelFace {
                     texture: String::new(),
                     rect: FaceRect {
@@ -667,7 +694,8 @@ mod tests {
                     group: 1,
                     origin: None,
                     size: None,
-                },
+                part: None,
+},
             ],
             uv_size: (16.0, 16.0),
         };
@@ -693,7 +721,8 @@ mod tests {
                 group: 0,
                 origin: None,
                 size: None,
-            }],
+            part: None,
+}],
             uv_size: (64.0, 64.0),
         };
         let image = RgbaImage::new(32, 32);
@@ -860,7 +889,8 @@ mod tests {
             group: 0,
             origin: None,
             size: None,
-        };
+        part: None,
+};
         let mut same = full.clone();
         same.face = "east".into();
         assert!(!is_atlas_layout(&[full.clone(), same]));

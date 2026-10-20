@@ -695,6 +695,7 @@ mod tests {
             group: 0,
         origin: None,
         size: None,
+part: None,
 }
     }
 
@@ -721,6 +722,7 @@ mod tests {
                 group: 0,
             origin: None,
             size: None,
+part: None,
 },
             ModelFace {
                 texture: String::new(),
@@ -729,6 +731,7 @@ mod tests {
                 group: 0,
             origin: None,
             size: None,
+part: None,
 },
             ModelFace {
                 texture: String::new(),
@@ -737,6 +740,7 @@ mod tests {
                 group: 0,
             origin: None,
             size: None,
+part: None,
 },
             ModelFace {
                 texture: String::new(),
@@ -745,6 +749,7 @@ mod tests {
                 group: 0,
             origin: None,
             size: None,
+part: None,
 },
             ModelFace {
                 texture: String::new(),
@@ -753,6 +758,7 @@ mod tests {
                 group: 0,
             origin: None,
             size: None,
+part: None,
 },
             ModelFace {
                 texture: String::new(),
@@ -761,6 +767,7 @@ mod tests {
                 group: 0,
             origin: None,
             size: None,
+part: None,
 },
         ];
         (image, faces)
@@ -995,6 +1002,7 @@ mod tests {
             group: 0,
         origin: None,
         size: None,
+part: None,
 };
         let north = ModelFace {
             texture: String::new(),
@@ -1008,6 +1016,7 @@ mod tests {
             group: 0,
         origin: None,
         size: None,
+part: None,
 };
         let group: HashMap<&str, &ModelFace> =
             [("west", &west), ("north", &north)].into_iter().collect();
@@ -1044,6 +1053,7 @@ mod tests {
             group: 0,
         origin: None,
         size: None,
+part: None,
 };
         let group: HashMap<&str, &ModelFace> = [("north", &north)].into_iter().collect();
         let tile = build_padded_tile(&image, &north, &group, 1);
