@@ -170,6 +170,9 @@ as text.
 
 ```sh
 cargo run --bin gui
+
+# or open a texture right away
+cargo run --bin gui -- path/to/texture.png
 ```
 
 * Compare the original and the upscaled texture with a wipe slider.
@@ -179,6 +182,7 @@ cargo run --bin gui
   rasterizer, no browser involved.
 * Run a batch with a progress bar, cancel it, then zip the pack and install
   it into Minecraft.
+* Animated textures play, at the speed their `.mcmeta` asks for.
 
 ## Connected textures
 

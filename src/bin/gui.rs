@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use gpui::{
     App, Application, Bounds, ClickEvent, Context, PathPromptOptions, RenderImage, SharedString,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, img, prelude::*, px, rgb,
-    size,
+    Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, img, prelude::*, px,
+    rgb, size,
 };
 use image::{Rgba, RgbaImage};
 
@@ -29,11 +29,13 @@ struct Animation {
     frame_width: u32,
     frame_height: u32,
     /// The time one frame is shown, in milliseconds.
-    #[allow(dead_code)]
     frame_time: u64,
 }
 
 fn main() {
+    // A texture to open right away, so the app can be started with one.
+    let texture = std::env::args().nth(1).map(PathBuf::from);
+
     Application::new().run(|cx: &mut App| {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([
@@ -51,7 +53,15 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| AppView::new()),
+            |_, cx| {
+                cx.new(|cx| {
+                    let mut view = AppView::new();
+                    if let Some(path) = texture {
+                        view.load_texture(path, cx);
+                    }
+                    view
+                })
+            },
         )
         .unwrap();
 
@@ -92,6 +102,8 @@ struct AppView {
     picker_source: Option<PathBuf>,
     /// The animation of the loaded texture.
     animation: Option<Animation>,
+    /// The task that moves the animation on, if there is one.
+    animation_task: Option<Task<()>>,
     frame: usize,
     /// The 3D preview.
     show_3d: bool,
@@ -129,6 +141,7 @@ impl AppView {
             picker_models: Vec::new(),
             picker_source: None,
             animation: None,
+            animation_task: None,
             frame: 0,
             show_3d: false,
             yaw: 0.6,
@@ -179,7 +192,7 @@ impl AppView {
             };
             let Some(path) = selected else { return };
             this.update(cx, |view, cx| {
-                view.load_texture(path);
+                view.load_texture(path, cx);
                 cx.notify();
             })
             .ok();
@@ -225,7 +238,7 @@ impl AppView {
         .detach();
     }
 
-    fn load_texture(&mut self, path: PathBuf) {
+    fn load_texture(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         match image::open(&path) {
             Ok(image) => {
                 let rgba = image.to_rgba8();
@@ -236,6 +249,7 @@ impl AppView {
                 self.error = None;
                 self.frame = 0;
                 self.animation = read_animation(&path);
+                self.start_animation(cx);
                 let (width, height) = self
                     .source
                     .as_ref()
@@ -251,6 +265,56 @@ impl AppView {
             }
             Err(error) => self.set_error(format!("cannot read texture: {error}")),
         }
+    }
+
+    /// Move the animation on, one frame at a time.
+    ///
+    /// The task is replaced whenever another texture is loaded, so the old
+    /// one stops.
+    fn start_animation(&mut self, cx: &mut Context<Self>) {
+        // Dropping the task cancels it.
+        self.animation_task = None;
+
+        let Some(animation) = self.animation else {
+            return;
+        };
+        let frames = self
+            .source
+            .as_ref()
+            .map_or(0, |image| frame_count(animation, image.height()));
+        if frames <= 1 {
+            return;
+        }
+        // Never go faster than twenty frames a second.
+        let frame_time = animation.frame_time.clamp(50, 1000);
+
+        self.animation_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(frame_time))
+                    .await;
+                let Ok(keep_going) = this.update(cx, |view, cx| {
+                    let Some(animation) = view.animation else {
+                        return false;
+                    };
+                    let frames = view
+                        .source
+                        .as_ref()
+                        .map_or(0, |image| frame_count(animation, image.height()));
+                    if frames <= 1 {
+                        return false;
+                    }
+                    view.frame = (view.frame + 1) % frames;
+                    cx.notify();
+                    true
+                }) else {
+                    break;
+                };
+                if !keep_going {
+                    break;
+                }
+            }
+        }));
     }
 
     fn load_model_file(&mut self, path: PathBuf) {
@@ -992,7 +1056,7 @@ fn list_entity_models() -> Vec<String> {
 }
 
 impl Render for AppView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_source = self.source.is_some();
         let has_result = self.result.is_some();
         let has_model = self.model_faces.is_some();
@@ -1037,6 +1101,11 @@ impl Render for AppView {
                 )
             })
             .unwrap_or(1);
+
+        // An animated texture needs a new frame on the screen all the time.
+        if frames > 1 {
+            window.request_animation_frame();
+        }
 
         let open_texture = cx.listener(Self::open_texture);
         let open_model = cx.listener(Self::open_model);
