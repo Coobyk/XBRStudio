@@ -89,6 +89,7 @@ Useful flags:
 | `--algorithm xbrz\|fsr\|lanczos3\|bicubic\|nearest` | The upscaler. |
 | `--alpha straight\|premultiplied\|masked` | How transparent texels are handled. |
 | `--sharpen 0..1` | An extra sharpening pass. |
+| `--gpu` | Run xBRZ and the edge adaptive upscaler on the GPU. |
 | `--models <dir>` | Where the entity models live (default `models/entity`). |
 | `--only <text>` | Only process the textures whose path contains `<text>`. |
 | `--resume` | Skip the textures that are already up to date. |
@@ -127,6 +128,28 @@ whether leaves and glass grow grey fringes:
   neighbours.
 * `masked` — every tap is weighted by the alpha of the texel it reads, so
   fully transparent texels do not contribute at all.
+
+### The GPU
+
+With `--gpu` xBRZ and the edge adaptive upscaler run on the GPU, in a
+compute shader.
+
+The xBRZ shader is a transliteration of the algorithm the CPU uses, down to
+the quantised colour distance table, so the GPU gives the **same pixels** and
+not an approximation. The tests check that on blocks, gradients, noise and
+transparent textures, for every factor from 2 to 6, and a whole Minecraft
+client jar comes out byte for byte the same either way.
+
+```sh
+xbrstudio --jar minecraft-client.jar --output pack_x4 --gpu
+```
+
+How much this helps depends on the machine. On a real GPU the scaling is
+several times faster than on the CPU, but a pack mostly waits for the disk
+and the PNG encoder, so the difference in the total time stays small. On a
+machine without a GPU the Vulkan driver falls back to a software rasteriser,
+and there the GPU path is slower than the CPU — the tool uses the CPU
+whenever there is no device.
 
 ### Entity models
 

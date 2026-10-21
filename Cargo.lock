@@ -7501,6 +7501,7 @@ dependencies = [
 name = "xbrstudio"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "clap",
  "dirs 5.0.1",
  "gpui",

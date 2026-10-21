@@ -66,16 +66,9 @@ pub fn scale_plain(image: &RgbaImage, config: &UpscaleConfig) -> Result<RgbaImag
     };
 
     let mut scaled = match config.algorithm {
-        Algorithm::Xbrz | Algorithm::Nearest => config.algorithm.scale(&source, config.factor)?,
-        Algorithm::Fsr => {
-            // The GPU backend runs the same algorithm, so the result is the
-            // same up to the rounding.
-            #[cfg(feature = "gpu")]
-            if let Some(context) = crate::gpu::context() {
-                return context.upscale(&source, config.factor);
-            }
-            crate::scalers::fsr::scale_fsr(&source, config.factor)
-        }
+        Algorithm::Xbrz => scale_xbrz(&source, config.factor)?,
+        Algorithm::Nearest => config.algorithm.scale(&source, config.factor)?,
+        Algorithm::Fsr => scale_fsr(&source, config.factor)?,
         Algorithm::Lanczos3 | Algorithm::Bicubic => {
             let kernel: &dyn crate::scalers::resample::Kernel = match config.algorithm {
                 Algorithm::Lanczos3 => &crate::scalers::resample::Lanczos3,
@@ -99,6 +92,27 @@ pub fn scale_plain(image: &RgbaImage, config: &UpscaleConfig) -> Result<RgbaImag
     }
 
     Ok(scaled)
+}
+
+/// Scale with xBRZ, on the GPU when there is a device.
+///
+/// The shader is a transliteration of the algorithm, so the GPU and the CPU
+/// produce the same pixels.
+fn scale_xbrz(image: &RgbaImage, factor: u32) -> Result<RgbaImage, String> {
+    #[cfg(feature = "gpu")]
+    if let Some(context) = crate::gpu::context() {
+        return context.xbrz(image, factor);
+    }
+    Algorithm::Xbrz.scale(image, factor)
+}
+
+/// Scale with the edge adaptive algorithm, on the GPU when there is a device.
+fn scale_fsr(image: &RgbaImage, factor: u32) -> Result<RgbaImage, String> {
+    #[cfg(feature = "gpu")]
+    if let Some(context) = crate::gpu::context() {
+        return context.upscale(image, factor);
+    }
+    Ok(crate::scalers::fsr::scale_fsr(image, factor))
 }
 
 /// Multiply the colour channels by alpha.

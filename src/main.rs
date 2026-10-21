@@ -57,7 +57,7 @@ struct Cli {
     #[arg(long, default_value_t = 0.0)]
     sharpen: f32,
 
-    /// Use the GPU for the edge adaptive upscaler.
+    /// Use the GPU for xBRZ and the edge adaptive upscaler.
     #[arg(long)]
     gpu: bool,
 
