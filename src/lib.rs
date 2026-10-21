@@ -1,3 +1,4 @@
+pub mod assets;
 pub mod cache;
 pub mod config;
 pub mod ctm;

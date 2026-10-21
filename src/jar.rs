@@ -28,6 +28,8 @@ pub use preview::{PreviewData, PreviewPair, load_preview_pairs};
 
 pub const TEXTURE_ROOT: &str = "assets/minecraft/textures/";
 const BLOCK_MODEL_ROOT: &str = "assets/minecraft/models/block/";
+const ITEM_MODEL_ROOT: &str = "assets/minecraft/models/item/";
+const ATLAS_ROOT: &str = "assets/minecraft/atlases/";
 
 #[derive(Debug, Clone)]
 pub struct BatchReport {
@@ -238,8 +240,19 @@ pub fn upscale_source(
     } else {
         Vec::new()
     };
+    // The sprites of the atlases say which textures the game packs into an
+    // atlas; the connected textures are only written for those.
+    let atlas_sprites: std::collections::HashSet<String> =
+        crate::assets::parse_atlases(&source.atlas_entries)
+            .into_iter()
+            .collect();
     let block_models = if opts.stitch {
-        load_block_models(&source.block_model_entries)
+        let mut models = load_block_models(&source.block_model_entries);
+        // The item models have the same layout, so they can be stitched too.
+        for (stem, faces) in crate::assets::load_item_models(&source.item_model_entries) {
+            models.entry(stem).or_insert(faces);
+        }
+        models
     } else {
         HashMap::new()
     };
@@ -327,6 +340,7 @@ pub fn upscale_source(
                             opts,
                             &models,
                             &block_models,
+                            &atlas_sprites,
                         );
                         if result.is_ok()
                             && let Ok(mut cache) = cache.lock()
@@ -344,6 +358,7 @@ pub fn upscale_source(
                     opts,
                     &models,
                     &block_models,
+                    &atlas_sprites,
                 ),
             };
             let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -426,6 +441,10 @@ struct Source {
     jobs: Vec<TextureJob>,
     /// The block models of the source, by their short name.
     block_model_entries: Vec<(String, Vec<u8>)>,
+    /// The item models of the source.
+    item_model_entries: Vec<(String, Vec<u8>)>,
+    /// The sprites of the atlases of the source.
+    atlas_entries: Vec<(String, Vec<u8>)>,
     pack_format: Option<i64>,
 }
 
@@ -438,6 +457,8 @@ fn read_archive(path: &Path) -> Result<Source, String> {
     let mut index_by_name: HashMap<String, usize> = HashMap::with_capacity(archive.len());
     let mut textures: Vec<(usize, String)> = Vec::new();
     let mut block_model_entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut item_model_entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut atlas_entries: Vec<(String, Vec<u8>)> = Vec::new();
     for index in 0..archive.len() {
         let name = archive
             .by_index(index)
@@ -458,6 +479,20 @@ fn read_archive(path: &Path) -> Result<Source, String> {
                 let bytes = read_entry(&mut archive, index)?;
                 block_model_entries.push((short, bytes));
             }
+        } else if name.starts_with(ITEM_MODEL_ROOT) && name.ends_with(".json") {
+            let short = name
+                .trim_end_matches(".json")
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if !short.is_empty() {
+                let bytes = read_entry(&mut archive, index)?;
+                item_model_entries.push((short, bytes));
+            }
+        } else if name.starts_with(ATLAS_ROOT) && name.ends_with(".json") {
+            let bytes = read_entry(&mut archive, index)?;
+            atlas_entries.push((name, bytes));
         }
     }
     textures.sort_by(|a, b| a.1.cmp(&b.1));
@@ -481,6 +516,8 @@ fn read_archive(path: &Path) -> Result<Source, String> {
     Ok(Source {
         jobs,
         block_model_entries,
+        item_model_entries,
+        atlas_entries,
         pack_format,
     })
 }
@@ -489,6 +526,8 @@ fn read_archive(path: &Path) -> Result<Source, String> {
 fn read_directory(dir: &Path) -> Result<Source, String> {
     let mut jobs = Vec::new();
     let mut block_model_entries = Vec::new();
+    let mut item_model_entries = Vec::new();
+    let mut atlas_entries = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
 
     while let Some(current) = stack.pop() {
@@ -528,6 +567,23 @@ fn read_directory(dir: &Path) -> Result<Source, String> {
                 let bytes = std::fs::read(&path)
                     .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
                 block_model_entries.push((short, bytes));
+            } else if name.starts_with(ITEM_MODEL_ROOT) && name.ends_with(".json") {
+                let short = name
+                    .trim_end_matches(".json")
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if short.is_empty() {
+                    continue;
+                }
+                let bytes = std::fs::read(&path)
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+                item_model_entries.push((short, bytes));
+            } else if name.starts_with(ATLAS_ROOT) && name.ends_with(".json") {
+                let bytes = std::fs::read(&path)
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+                atlas_entries.push((name, bytes));
             }
         }
     }
@@ -549,6 +605,8 @@ fn read_directory(dir: &Path) -> Result<Source, String> {
     Ok(Source {
         jobs,
         block_model_entries,
+        item_model_entries,
+        atlas_entries,
         pack_format,
     })
 }
@@ -564,6 +622,7 @@ pub(crate) fn read_entry(archive: &mut ZipArchive<File>, index: usize) -> Result
     Ok(bytes)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_one(
     name: &str,
     bytes: &[u8],
@@ -572,6 +631,7 @@ fn process_one(
     opts: &BatchOptions,
     models: &[EntityModel],
     block_models: &HashMap<String, ModelFaces>,
+    atlas_sprites: &std::collections::HashSet<String>,
 ) -> Result<ProcessOutcome, String> {
     let relative = name.strip_prefix(TEXTURE_ROOT).unwrap_or(name);
 
@@ -691,6 +751,7 @@ fn process_one(
     if opts.connected_textures
         && let Some(model) = block_model
         && let Some(stem) = block_stem
+        && (atlas_sprites.is_empty() || atlas_sprites.contains(&format!("block/{stem}.png")))
     {
         connected = write_connected_textures(out_dir, &stem, model, &output, opts.factor)?;
     }

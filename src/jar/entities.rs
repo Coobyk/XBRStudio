@@ -297,13 +297,37 @@ pub fn signal_score(model: &EntityModel, ctx: &TextureCtx) -> i64 {
 
     signal
 }
+/// How well the UV space of a model fits the texture.
+///
+/// A model whose UV space is bigger than the texture is squeezed onto it,
+/// which makes the stitching blurry, so such a model is penalised. A model
+/// that is smaller than the texture is stretched, which the game does as
+/// well, so it is not.
+pub fn uv_fit_score(model: &EntityModel, image: (u32, u32)) -> i64 {
+    if image.0 == 0 || image.1 == 0 {
+        return 0;
+    }
+    let (uv_width, uv_height) = model.faces.uv_size;
+    if uv_width <= 0.0 || uv_height <= 0.0 {
+        return 0;
+    }
+    let over_x = (uv_width - image.0 as f32).max(0.0) / uv_width;
+    let over_y = (uv_height - image.1 as f32).max(0.0) / uv_height;
+    let over = over_x.max(over_y);
+    if over <= 0.0 {
+        return 0;
+    }
+    -((over * 4000.0) as i64)
+}
+
 pub fn score_model(model: &EntityModel, ctx: &TextureCtx, image: (u32, u32)) -> i64 {
     if signal_score(model, ctx) < MIN_SIGNAL {
         return i64::MIN / 4; // ineligible, but comparable for max()
     }
     let mut score = signal_score(model, ctx)
         + model.faces.faces.len() as i64
-        + if model.has_texture_size { 300 } else { 0 };
+        + if model.has_texture_size { 300 } else { 0 }
+        + uv_fit_score(model, image);
     // Prefer a model whose declared texture_size matches the image so a 32×32
     // baby pig is not stitched with the 64×64 adult UV layout (and vice versa).
     if model.has_texture_size && image != (0, 0) {
