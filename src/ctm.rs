@@ -236,6 +236,9 @@ fn compose_tile(
 
 /// Read a pixel of an image, scaled to the tile size.
 fn sample_scaled(image: &RgbaImage, x: u32, y: u32, size: u32) -> Rgba<u8> {
+    if image.width() == 0 || image.height() == 0 || size == 0 {
+        return Rgba([0, 0, 0, 0]);
+    }
     let sx = (x as u64 * image.width() as u64 / size as u64) as u32;
     let sy = (y as u64 * image.height() as u64 / size as u64) as u32;
     *image.get_pixel(sx.min(image.width() - 1), sy.min(image.height() - 1))

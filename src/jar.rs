@@ -240,12 +240,9 @@ pub fn upscale_source(
     } else {
         Vec::new()
     };
-    // The sprites of the atlases say which textures the game packs into an
-    // atlas; the connected textures are only written for those.
-    let atlas_sprites: std::collections::HashSet<String> =
-        crate::assets::parse_atlases(&source.atlas_entries)
-            .into_iter()
-            .collect();
+    // The atlases say which textures the game packs into an atlas; the
+    // connected textures are only written for those.
+    let atlases = crate::assets::parse_atlases(&source.atlas_entries);
     let block_models = if opts.stitch {
         let mut models = load_block_models(&source.block_model_entries);
         // The item models have the same layout, so they can be stitched too.
@@ -340,7 +337,7 @@ pub fn upscale_source(
                             opts,
                             &models,
                             &block_models,
-                            &atlas_sprites,
+                            &atlases,
                         );
                         if result.is_ok()
                             && let Ok(mut cache) = cache.lock()
@@ -358,7 +355,7 @@ pub fn upscale_source(
                     opts,
                     &models,
                     &block_models,
-                    &atlas_sprites,
+                    &atlases,
                 ),
             };
             let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -631,7 +628,7 @@ fn process_one(
     opts: &BatchOptions,
     models: &[EntityModel],
     block_models: &HashMap<String, ModelFaces>,
-    atlas_sprites: &std::collections::HashSet<String>,
+    atlases: &crate::assets::Atlases,
 ) -> Result<ProcessOutcome, String> {
     let relative = name.strip_prefix(TEXTURE_ROOT).unwrap_or(name);
 
@@ -751,7 +748,7 @@ fn process_one(
     if opts.connected_textures
         && let Some(model) = block_model
         && let Some(stem) = block_stem
-        && (atlas_sprites.is_empty() || atlas_sprites.contains(&format!("block/{stem}.png")))
+        && atlases.contains(&format!("block/{stem}.png"))
     {
         connected = write_connected_textures(out_dir, &stem, model, &output, opts.factor)?;
     }
@@ -802,6 +799,10 @@ fn write_connected_textures(
         let width = face.rect.width * factor;
         let height = face.rect.height * factor;
         if x + width > upscaled.width() || y + height > upscaled.height() {
+            continue;
+        }
+        if width == 0 || height == 0 {
+            // A face without an area (a flat cube) has nothing to show.
             continue;
         }
         let image = image::imageops::crop_imm(upscaled, x, y, width, height).to_image();
