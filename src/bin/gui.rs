@@ -36,6 +36,11 @@ fn main() {
     // A texture to open right away, so the app can be started with one.
     let texture = std::env::args().nth(1).map(PathBuf::from);
 
+    // Use the GPU for the scaling when there is one. Without a device the
+    // work stays on the CPU, so this never fails.
+    #[cfg(feature = "gpu")]
+    let _ = xbrstudio::gpu::init();
+
     Application::new().run(|cx: &mut App| {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([
