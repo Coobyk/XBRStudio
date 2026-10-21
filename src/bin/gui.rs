@@ -115,6 +115,13 @@ struct AppView {
     yaw: f32,
     pitch: f32,
     preview_image: Option<Arc<RenderImage>>,
+    /// True while the app is scaling in the background.
+    working: bool,
+    /// The number of the running upscale, so the result of an old one can be
+    /// thrown away.
+    job: u64,
+    /// The same for the 3D preview.
+    preview_job: u64,
 }
 
 impl AppView {
@@ -152,6 +159,9 @@ impl AppView {
             yaw: 0.6,
             pitch: 0.3,
             preview_image: None,
+            working: false,
+            job: 0,
+            preview_job: 0,
         }
     }
 
@@ -235,7 +245,7 @@ impl AppView {
             };
             let Some(path) = selected else { return };
             this.update(cx, |view, cx| {
-                view.load_model_file(path);
+                view.load_model_file(path, cx);
                 cx.notify();
             })
             .ok();
@@ -324,14 +334,14 @@ impl AppView {
         }));
     }
 
-    fn load_model_file(&mut self, path: PathBuf) {
+    fn load_model_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         match load_model(&path) {
             Ok(faces) => {
                 self.model_label = path
                     .file_name()
                     .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_else(|| path.display().to_string());
-                self.set_model(faces);
+                self.set_model(faces, cx);
                 self.status = format!("Loaded model {}.", self.model_label);
                 self.error = None;
             }
@@ -339,7 +349,7 @@ impl AppView {
         }
     }
 
-    fn set_model(&mut self, mut faces: ModelFaces) {
+    fn set_model(&mut self, mut faces: ModelFaces, cx: &mut Context<Self>) {
         if let Some(source) = &self.source {
             xbrstudio::model::scale_model_faces_to_image(&mut faces, source);
         }
@@ -350,7 +360,7 @@ impl AppView {
         self.model_faces = Some(faces);
         self.stitch = true;
         self.clear_result();
-        self.update_preview();
+        self.update_preview(cx);
     }
 
     // ------------------------------------------------------------ model picker
@@ -378,7 +388,7 @@ impl AppView {
                 cx.notify();
                 return;
             }
-            self.load_model_file(path);
+            self.load_model_file(path, cx);
             cx.notify();
             return;
         };
@@ -386,7 +396,7 @@ impl AppView {
         match jar::load_block_model(&source, &name) {
             Ok(faces) => {
                 self.model_label = name.clone();
-                self.set_model(faces);
+                self.set_model(faces, cx);
                 self.status = format!("Loaded block model {name}.");
                 self.error = None;
             }
@@ -511,32 +521,64 @@ impl AppView {
             sharpen: self.sharpen,
         };
 
-        let result = if wrap {
-            upscale_wrapped(&source, &config)
-        } else {
-            upscale_image(&source, faces.as_deref(), &config)
-        };
-        match result {
-            Ok(result) => {
-                self.result_image = Some(to_render_image(&result));
-                self.result = Some(result);
-                self.update_compare();
-                self.update_preview();
-                let result_ref = self.result.as_ref().expect("just set");
-                self.status = format!(
-                    "Upscaled {}x{} -> {}x{} (factor {}, {})",
-                    source.width(),
-                    source.height(),
-                    result_ref.width(),
-                    result_ref.height(),
-                    self.factor,
-                    self.algorithm.name()
-                );
-                self.error = None;
-            }
-            Err(error) => self.set_error(error),
-        }
+        // The scaling happens on a thread of its own, so the window stays
+        // alive while it runs.
+        let (source_width, source_height) = (source.width(), source.height());
+        let split = self.split;
+        self.job += 1;
+        let job = self.job;
+        self.working = true;
+        self.status = "Upscaling…".into();
+        self.error = None;
         cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let result = if wrap {
+                        upscale_wrapped(&source, &config)
+                    } else {
+                        upscale_image(&source, faces.as_deref(), &config)
+                    };
+                    result.map(|result| {
+                        let compare = build_compare(&source, &result, split);
+                        (result, compare)
+                    })
+                })
+                .await;
+
+            this.update(cx, |view, cx| {
+                if view.job != job {
+                    // A newer job is already running.
+                    return;
+                }
+                view.working = false;
+                match result {
+                    Ok((result, compare)) => {
+                        view.result_image = Some(to_render_image(&result));
+                        view.result = Some(result);
+                        view.compare_image = Some(to_render_image(&compare));
+                        view.update_preview(cx);
+                        let result_ref = view.result.as_ref().expect("just set");
+                        view.status = format!(
+                            "Upscaled {}x{} -> {}x{} (factor {}, {})",
+                            source_width,
+                            source_height,
+                            result_ref.width(),
+                            result_ref.height(),
+                            view.factor,
+                            view.algorithm.name()
+                        );
+                        view.error = None;
+                    }
+                    Err(error) => view.set_error(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The comparison image: the original (blown up to the size of the
@@ -563,19 +605,8 @@ impl AppView {
             None => (source.clone(), result.clone()),
         };
 
-        let width = result.width();
-        let height = result.height();
-        let mut image = RgbaImage::new(width, height);
-        let split_x = (width as f32 * self.split) as u32;
-        for y in 0..height {
-            for x in 0..width {
-                let original = sample_nearest(&source, x, y, width, height);
-                let upscaled = *result.get_pixel(x, y);
-                let pixel = if x < split_x { original } else { upscaled };
-                image.put_pixel(x, y, pixel);
-            }
-        }
-        self.compare_image = Some(to_render_image(&image));
+        let compare = build_compare(&source, &result, self.split);
+        self.compare_image = Some(to_render_image(&compare));
     }
 
     fn set_split(
@@ -591,12 +622,15 @@ impl AppView {
     }
 
     /// The 3D preview of the model.
-    fn update_preview(&mut self) {
+    ///
+    /// The picture is rendered on a thread of its own, the software
+    /// rasteriser takes a moment.
+    fn update_preview(&mut self, cx: &mut Context<Self>) {
         if !self.show_3d {
             self.preview_image = None;
             return;
         }
-        let Some(faces) = &self.model_faces else {
+        let Some(faces) = self.model_faces.clone() else {
             self.preview_image = None;
             return;
         };
@@ -606,14 +640,36 @@ impl AppView {
             .or(self.source.as_ref())
             .cloned()
             .unwrap_or_else(|| RgbaImage::new(16, 16));
-        let mesh = preview3d::build_mesh(faces);
-        let image = preview3d::render(&mesh, &texture, 320, 320, self.yaw, self.pitch);
-        self.preview_image = Some(to_render_image(&image));
+        let yaw = self.yaw;
+        let pitch = self.pitch;
+
+        self.preview_job += 1;
+        let job = self.preview_job;
+
+        cx.spawn(async move |this, cx| {
+            let image = cx
+                .background_executor()
+                .spawn(async move {
+                    let mesh = preview3d::build_mesh(&faces);
+                    preview3d::render(&mesh, &texture, 320, 320, yaw, pitch)
+                })
+                .await;
+
+            this.update(cx, |view, cx| {
+                if view.preview_job != job {
+                    return;
+                }
+                view.preview_image = Some(to_render_image(&image));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn toggle_3d(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.show_3d = !self.show_3d;
-        self.update_preview();
+        self.update_preview(cx);
         cx.notify();
     }
 
@@ -627,7 +683,7 @@ impl AppView {
     ) {
         self.yaw += dyaw;
         self.pitch = (self.pitch + dpitch).clamp(-1.4, 1.4);
-        self.update_preview();
+        self.update_preview(cx);
         cx.notify();
     }
 
@@ -676,27 +732,46 @@ impl AppView {
                     }
                 };
                 let Some(path) = selected else { return };
+                // Take a copy of the result and write it on a thread of its
+                // own, a big texture takes a moment.
+                let Some(result) = this
+                    .update(cx, |view, _cx| view.result.clone())
+                    .ok()
+                    .flatten()
+                else {
+                    this.update(cx, |view, cx| {
+                        view.set_error("run upscale first");
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                };
                 this.update(cx, |view, cx| {
-                    view.write_result(&path);
+                    view.working = true;
+                    view.status = "Saving…".into();
+                    cx.notify();
+                })
+                .ok();
+                let saved_path = path.clone();
+                let written = cx
+                    .background_executor()
+                    .spawn(async move { result.save(&path) })
+                    .await;
+                this.update(cx, |view, cx| {
+                    view.working = false;
+                    match written {
+                        Ok(()) => {
+                            view.error = None;
+                            view.status = format!("Saved {}", saved_path.display());
+                        }
+                        Err(error) => view
+                            .set_error(format!("cannot write {}: {error}", saved_path.display())),
+                    }
                     cx.notify();
                 })
                 .ok();
             })
             .detach();
-    }
-
-    fn write_result(&mut self, path: &std::path::Path) {
-        let Some(result) = &self.result else {
-            self.set_error("run upscale first");
-            return;
-        };
-        match result.save(path) {
-            Ok(()) => {
-                self.error = None;
-                self.status = format!("Saved {}", path.display());
-            }
-            Err(error) => self.set_error(format!("cannot write {}: {error}", path.display())),
-        }
     }
 
     // ------------------------------------------------------------------- batch
@@ -836,34 +911,14 @@ impl AppView {
 
             loop {
                 let mut finished = false;
+                // The worker sends a message for every texture. Only the
+                // last one is drawn, so the window is not redrawn thousands
+                // of times.
+                let mut latest: Option<BatchProgress> = None;
                 loop {
                     match receiver.try_recv() {
-                        Ok(JarMessage::Progress(BatchProgress::Started {
-                            total,
-                            entity_models,
-                            block_models,
-                        })) => {
-                            this.update(cx, |view, cx| {
-                                view.batch_total = total;
-                                view.status = format!(
-                                    "Upscaling 0/{total} textures ({entity_models} entity, {block_models} block models)"
-                                );
-                                cx.notify();
-                            })
-                            .ok();
-                        }
-                        Ok(JarMessage::Progress(BatchProgress::Texture {
-                            done,
-                            total,
-                            name,
-                        })) => {
-                            this.update(cx, |view, cx| {
-                                view.batch_done = done;
-                                view.batch_total = total;
-                                view.status = format!("[{done}/{total}] {name}");
-                                cx.notify();
-                            })
-                            .ok();
+                        Ok(JarMessage::Progress(progress)) => {
+                            latest = Some(progress);
                         }
                         Ok(JarMessage::Finished(result)) => {
                             this.update(cx, |view, cx| {
@@ -929,6 +984,31 @@ impl AppView {
                         }
                     }
                 }
+                // Draw the progress of the batch, but only once for all the
+                // textures that came in since the last time.
+                if let Some(progress) = latest {
+                    this.update(cx, |view, cx| {
+                        match progress {
+                            BatchProgress::Started {
+                                total,
+                                entity_models,
+                                block_models,
+                            } => {
+                                view.batch_total = total;
+                                view.status = format!(
+                                    "Upscaling 0/{total} textures ({entity_models} entity, {block_models} block models)"
+                                );
+                            }
+                            BatchProgress::Texture { done, total, name } => {
+                                view.batch_done = done;
+                                view.batch_total = total;
+                                view.status = format!("[{done}/{total}] {name}");
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                }
                 if finished {
                     break;
                 }
@@ -949,6 +1029,9 @@ impl AppView {
     }
 
     /// Zip the pack of the last batch.
+    ///
+    /// A big pack takes a while to zip, so it happens on a thread of its
+    /// own.
     fn build_pack(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(dir) = self.batch_dir.clone() else {
             self.set_error("run a jar batch first");
@@ -956,14 +1039,31 @@ impl AppView {
             return;
         };
         let zip_path = dir.with_extension("zip");
-        match pack::zip_directory(&dir, &zip_path) {
-            Ok(()) => {
-                self.status = format!("Wrote {}", zip_path.display());
-                self.error = None;
-            }
-            Err(error) => self.set_error(error),
-        }
+        let written_path = zip_path.clone();
+        self.working = true;
+        self.status = "Zipping the pack…".into();
         cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { pack::zip_directory(&dir, &zip_path) })
+                .await;
+
+            this.update(cx, |view, cx| {
+                view.working = false;
+                match result {
+                    Ok(()) => {
+                        view.status = format!("Wrote {}", written_path.display());
+                        view.error = None;
+                    }
+                    Err(error) => view.set_error(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Install the pack of the last batch into Minecraft.
@@ -974,21 +1074,35 @@ impl AppView {
             return;
         };
         let zip_path = dir.with_extension("zip");
-        if !zip_path.is_file()
-            && let Err(error) = pack::zip_directory(&dir, &zip_path)
-        {
-            self.set_error(error);
-            cx.notify();
-            return;
-        }
-        match pack::install_pack(&zip_path) {
-            Ok(path) => {
-                self.status = format!("Installed {}", path.display());
-                self.error = None;
-            }
-            Err(error) => self.set_error(error),
-        }
+        self.working = true;
+        self.status = "Installing the pack…".into();
         cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if !zip_path.is_file() {
+                        pack::zip_directory(&dir, &zip_path)?;
+                    }
+                    pack::install_pack(&zip_path)
+                })
+                .await;
+
+            this.update(cx, |view, cx| {
+                view.working = false;
+                match result {
+                    Ok(path) => {
+                        view.status = format!("Installed {}", path.display());
+                        view.error = None;
+                    }
+                    Err(error) => view.set_error(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 }
 
@@ -1073,6 +1187,7 @@ impl Render for AppView {
         let alpha = self.alpha;
         let sharpen = self.sharpen;
         let batch_running = self.batch_running;
+        let working = self.working;
         let batch_done = self.batch_done;
         let batch_total = self.batch_total;
         let picker_open = self.picker_open;
@@ -1091,6 +1206,7 @@ impl Render for AppView {
             Some(error) => format!("error: {error}"),
             None => self.status.clone(),
         };
+
         let texture_label = self
             .texture_path
             .as_deref()
@@ -1336,7 +1452,7 @@ impl Render for AppView {
                     .child(toolbar_group(
                         "Actions",
                         vec![
-                            toolbar_button("Upscale", false, has_source, run_upscale),
+                            toolbar_button("Upscale", false, has_source && !working, run_upscale),
                             toolbar_button("Save…", false, has_result, save_result),
                             toolbar_button("Build pack", false, true, build_pack),
                             toolbar_button("Install", false, true, install_pack),
@@ -1585,7 +1701,20 @@ impl Render for AppView {
                     .py_1()
                     .border_t_1()
                     .border_color(rgb(0x3c3c3c))
-                    .child(div().flex_1().text_color(rgb(0x9a9a9a)).child(status_line))
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .text_color(rgb(0x9a9a9a))
+                            .child(status_line),
+                    )
+                    // A little dot next to the status while the app works.
+                    .when(working, |this| {
+                        this.child(div().w(px(10.)).h(px(10.)).rounded_full().bg(rgb(0x5b93d4)))
+                    })
                     .when(batch_total > 0, |this| {
                         this.child(
                             div()
@@ -1766,6 +1895,23 @@ fn primary_button(
         .hover(|style| style.bg(rgb(0x4a80c0)))
         .on_click(on_click)
         .child(label)
+}
+
+/// The comparison image: the original (blown up to the size of the result)
+/// on the left of the split, the result on the right.
+fn build_compare(source: &RgbaImage, result: &RgbaImage, split: f32) -> RgbaImage {
+    let width = result.width();
+    let height = result.height();
+    let mut image = RgbaImage::new(width, height);
+    let split_x = (width as f32 * split) as u32;
+    for y in 0..height {
+        for x in 0..width {
+            let original = sample_nearest(source, x, y, width, height);
+            let upscaled = *result.get_pixel(x, y);
+            image.put_pixel(x, y, if x < split_x { original } else { upscaled });
+        }
+    }
+    image
 }
 
 /// The zoom that makes a texture fill the canvas.
