@@ -5,9 +5,9 @@ use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
 use gpui::{
-    App, Application, Bounds, ClickEvent, Context, PathPromptOptions, RenderImage, SharedString,
-    Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, img, prelude::*, px,
-    rgb, size,
+    App, Application, Bounds, ClickEvent, Context, Div, FontWeight, PathPromptOptions, RenderImage,
+    SharedString, Stateful, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions,
+    div, img, prelude::*, px, rgb, size,
 };
 use image::{Rgba, RgbaImage};
 
@@ -48,7 +48,7 @@ fn main() {
             gpui::KeyBinding::new("ctrl-q", Quit, None),
         ]);
 
-        let bounds = Bounds::centered(None, size(px(1180.), px(780.)), cx);
+        let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
         cx.open_window(
             WindowOptions {
                 titlebar: Some(TitlebarOptions {
@@ -247,6 +247,7 @@ impl AppView {
         match image::open(&path) {
             Ok(image) => {
                 let rgba = image.to_rgba8();
+                let (width, height) = (rgba.width(), rgba.height());
                 self.source_image = Some(to_render_image(&rgba));
                 self.source = Some(rgba);
                 self.texture_path = Some(path.clone());
@@ -254,6 +255,7 @@ impl AppView {
                 self.error = None;
                 self.frame = 0;
                 self.animation = read_animation(&path);
+                self.zoom = fit_zoom(width, height);
                 self.start_animation(cx);
                 let (width, height) = self
                     .source
@@ -1080,6 +1082,11 @@ impl Render for AppView {
         let compare_image = self.compare_image.clone();
         let _source_image = self.source_image.clone();
         let preview_image = self.preview_image.clone();
+        let (source_width, source_height) = self
+            .source
+            .as_ref()
+            .map(|image| (image.width(), image.height()))
+            .unwrap_or((16, 16));
         let status_line = match &self.error {
             Some(error) => format!("error: {error}"),
             None => self.status.clone(),
@@ -1115,6 +1122,9 @@ impl Render for AppView {
         let open_texture = cx.listener(Self::open_texture);
         let open_model = cx.listener(Self::open_model);
         let open_jar = cx.listener(Self::open_jar);
+        // The welcome screen has its own buttons.
+        let welcome_open_texture = cx.listener(Self::open_texture);
+        let welcome_open_jar = cx.listener(Self::open_jar);
         let toggle_picker = cx.listener(Self::toggle_picker);
         let toggle_stitch = cx.listener(Self::toggle_stitch);
         let run_upscale = cx.listener(Self::run_upscale);
@@ -1141,6 +1151,7 @@ impl Render for AppView {
             Algorithm::Fsr,
             Algorithm::Lanczos3,
             Algorithm::Bicubic,
+            Algorithm::Nearest,
         ]
         .into_iter()
         .map(|value| {
@@ -1210,62 +1221,126 @@ impl Render for AppView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0x1e1e1e))
+            .bg(rgb(0x161616))
             .text_color(rgb(0xe0e0e0))
+            .child(
+                // The title of the window.
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(0x2a2a2a))
+                    .bg(rgb(0x1b1b1b))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0xf2f2f2))
+                            .child("XBR Studio"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x6f6f6f))
+                            .child("Minecraft textures, upscaled properly"),
+                    )
+                    .child(div().flex_1()),
+            )
             .child(
                 // Toolbar
                 div()
                     .flex()
                     .flex_row()
                     .flex_wrap()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
+                    .items_end()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
                     .border_b_1()
-                    .border_color(rgb(0x3c3c3c))
-                    .child(toolbar_button("Open texture…", true, open_texture))
-                    .child(toolbar_button("Open model…", true, open_model))
-                    .child(toolbar_button("Open jar…", !batch_running, open_jar))
-                    .child(toolbar_button(
-                        if picker_open { "Hide models" } else { "Models…" },
-                        true,
-                        toggle_picker,
+                    .border_color(rgb(0x2a2a2a))
+                    .bg(rgb(0x1a1a1a))
+                    .child(toolbar_group(
+                        "File",
+                        vec![
+                            toolbar_button("Open texture…", false, true, open_texture),
+                            toolbar_button("Open model…", false, true, open_model),
+                            toolbar_button("Open jar…", false, !batch_running, open_jar),
+                        ],
                     ))
-                    .child(div().w(px(8.)))
-                    .children(factor_listeners.into_iter().map(|(value, listener)| {
-                        toolbar_button(
-                            format!("{value}×"),
-                            factor != value,
-                            listener,
-                        )
-                    }))
-                    .child(div().w(px(8.)))
-                    .children(algorithm_listeners.into_iter().map(|(value, listener)| {
-                        toolbar_button(value.name(), algorithm != value, listener)
-                    }))
-                    .child(div().w(px(8.)))
-                    .children(alpha_listeners.into_iter().map(|(value, listener)| {
-                        toolbar_button(value.name(), alpha != value, listener)
-                    }))
-                    .child(div().w(px(8.)))
-                    .children(sharpen_listeners.into_iter().map(|(value, listener)| {
-                        toolbar_button(
-                            format!("sharp {:.2}", value),
-                            (sharpen - value).abs() > f32::EPSILON,
-                            listener,
-                        )
-                    }))
-                    .child(div().w(px(8.)))
-                    .child(stitch_toggle(has_model && stitch, has_model, toggle_stitch))
-                    .child(toolbar_button("Upscale", has_source, run_upscale))
-                    .child(toolbar_button("Save…", has_result, save_result))
-                    .child(toolbar_button("Build pack", true, build_pack))
-                    .child(toolbar_button("Install", true, install_pack))
-                    .child(toolbar_button(
-                        if show_3d { "Hide 3D" } else { "3D preview" },
-                        has_model,
-                        toggle_3d,
+                    .child(toolbar_group(
+                        "Scale",
+                        factor_listeners
+                            .into_iter()
+                            .map(|(value, listener)| {
+                                toolbar_button(format!("{value}×"), factor == value, true, listener)
+                            })
+                            .collect(),
+                    ))
+                    .child(toolbar_group(
+                        "Algorithm",
+                        algorithm_listeners
+                            .into_iter()
+                            .map(|(value, listener)| {
+                                toolbar_button(value.name(), algorithm == value, true, listener)
+                            })
+                            .collect(),
+                    ))
+                    .child(toolbar_group(
+                        "Alpha",
+                        alpha_listeners
+                            .into_iter()
+                            .map(|(value, listener)| {
+                                toolbar_button(value.name(), alpha == value, true, listener)
+                            })
+                            .collect(),
+                    ))
+                    .child(toolbar_group(
+                        "Sharpen",
+                        sharpen_listeners
+                            .into_iter()
+                            .map(|(value, listener)| {
+                                toolbar_button(
+                                    format!("{value:.2}"),
+                                    (sharpen - value).abs() < f32::EPSILON,
+                                    true,
+                                    listener,
+                                )
+                            })
+                            .collect(),
+                    ))
+                    .child(toolbar_group(
+                        "Model",
+                        vec![
+                            toolbar_button(
+                                if picker_open {
+                                    "Hide models"
+                                } else {
+                                    "Models…"
+                                },
+                                picker_open,
+                                true,
+                                toggle_picker,
+                            ),
+                            stitch_toggle(stitch, has_model, toggle_stitch),
+                            toolbar_button(
+                                if show_3d { "Hide 3D" } else { "3D preview" },
+                                show_3d,
+                                has_model,
+                                toggle_3d,
+                            ),
+                        ],
+                    ))
+                    .child(toolbar_group(
+                        "Actions",
+                        vec![
+                            toolbar_button("Upscale", false, has_source, run_upscale),
+                            toolbar_button("Save…", false, has_result, save_result),
+                            toolbar_button("Build pack", false, true, build_pack),
+                            toolbar_button("Install", false, true, install_pack),
+                        ],
                     )),
             )
             .child(
@@ -1297,11 +1372,19 @@ impl Render for AppView {
                                         .id(SharedString::from(format!("model-{name}")))
                                         .px_2()
                                         .py_1()
-                                        .cursor_pointer()
+                                        .text_sm()
                                         .text_color(rgb(0xd0d0d0))
+                                        .cursor_pointer()
                                         .hover(|style| style.bg(rgb(0x333333)))
                                         .on_click(listener)
-                                        .child(name)
+                                        // Only the file name, the folder is
+                                        // the same for all of them.
+                                        .child(
+                                            Path::new(&name)
+                                                .file_name()
+                                                .map(|name| name.to_string_lossy().to_string())
+                                                .unwrap_or_else(|| name.clone()),
+                                        )
                                 })),
                         )
                     })
@@ -1317,16 +1400,20 @@ impl Render for AppView {
                                     .flex_col()
                                     .flex_1()
                                     .min_h_0()
-                                    .px_2()
+                                    .px_3()
                                     .pt_2()
                                     .child(
                                         div()
-                                            .text_color(rgb(0xb0b0b0))
-                                            .child(format!(
-                                                "{texture_label}    {model_label}    faces: {face_count}    frame: {}/{}",
-                                                frame + 1,
-                                                frames
-                                            )),
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_3()
+                                            .text_sm()
+                                            .text_color(rgb(0x8a8a8a))
+                                            .child(texture_label.clone())
+                                            .child(model_label.clone())
+                                            .child(format!("faces: {face_count}"))
+                                            .child(format!("frame: {}/{}", frame + 1, frames)),
                                     )
                                     .child(
                                         div()
@@ -1334,10 +1421,10 @@ impl Render for AppView {
                                             .flex_1()
                                             .min_h(px(120.))
                                             .mt_2()
-                                            .bg(rgb(0x141414))
+                                            .bg(rgb(0x111111))
                                             .border_1()
-                                            .border_color(rgb(0x404040))
-                                            .rounded_sm()
+                                            .border_color(rgb(0x2e2e2e))
+                                            .rounded_md()
                                             .p_2()
                                             .overflow_hidden()
                                             .child(
@@ -1346,22 +1433,36 @@ impl Render for AppView {
                                                     .flex()
                                                     .items_center()
                                                     .justify_center()
-                                                    .when_some(compare_image.clone(), |this, image| {
-                                                        this.child(
-                                                            img(image)
-                                                                .id("compare")
-                                                                .object_fit(gpui::ObjectFit::Contain)
-                                                                .w(px(16. * zoom.max(1.0)))
-                                                                .h(px(16. * zoom.max(1.0))),
-                                                        )
+                                                    .when_some(
+                                                        compare_image.clone(),
+                                                        |this, image| {
+                                                            this.child(
+                                                                img(image)
+                                                                    .id("compare")
+                                                                    .object_fit(
+                                                                        gpui::ObjectFit::Contain,
+                                                                    )
+                                                                    .w(px(source_width as f32
+                                                                        * zoom.max(0.25)))
+                                                                    .h(px(source_height as f32
+                                                                        * zoom.max(0.25))),
+                                                            )
+                                                        },
+                                                    )
+                                                    .when(!has_source, |this| {
+                                                        this.child(welcome_panel(
+                                                            welcome_open_texture,
+                                                            welcome_open_jar,
+                                                        ))
                                                     })
-                                                    .when(compare_image.is_none(), |this| {
-                                                        this.child(
-                                                            div()
-                                                                .text_color(rgb(0x606060))
-                                                                .child("Upscale a texture to compare it"),
-                                                        )
-                                                    }),
+                                                    .when(
+                                                        has_source && compare_image.is_none(),
+                                                        |this| {
+                                                            this.child(hint_panel(
+                                                                "Press Upscale to see the result",
+                                                            ))
+                                                        },
+                                                    ),
                                             ),
                                     )
                                     .child(
@@ -1372,38 +1473,69 @@ impl Render for AppView {
                                             .items_center()
                                             .gap_1()
                                             .mt_2()
-                                            .child(div().text_color(rgb(0x808080)).child("original"))
+                                            .child(
+                                                div().text_color(rgb(0x808080)).child("original"),
+                                            )
                                             .child(
                                                 div()
+                                                    .relative()
+                                                    .w(px(240.))
+                                                    .h(px(18.))
                                                     .flex()
-                                                    .flex_row()
-                                                    .gap_1()
+                                                    .items_center()
+                                                    // The track and the part of it
+                                                    // that is already upscaled.
+                                                    .child(
+                                                        div()
+                                                            .w(px(240.))
+                                                            .h(px(6.))
+                                                            .rounded_full()
+                                                            .bg(rgb(0x2e2e2e))
+                                                            .child(
+                                                                div()
+                                                                    .h_full()
+                                                                    .w(px(240.0 * split))
+                                                                    .rounded_full()
+                                                                    .bg(rgb(0x3c6ea8)),
+                                                            ),
+                                                    )
+                                                    // The handle.
+                                                    .child(
+                                                        div()
+                                                            .absolute()
+                                                            .left(px(240.0 * split - 7.))
+                                                            .w(px(14.))
+                                                            .h(px(14.))
+                                                            .rounded_full()
+                                                            .bg(rgb(0x8ab6e8)),
+                                                    )
+                                                    // The steps that can be
+                                                    // clicked.
                                                     .children(split_listeners.into_iter().map(
                                                         |(step, listener)| {
-                                                            let position = step as f32 / 20.0;
-                                                            let selected = (position - split).abs() < 0.026;
                                                             div()
-                                                                .id(SharedString::from(format!("split-{step}")))
-                                                                .w(px(14.))
-                                                                .h(px(14.))
-                                                                .rounded_sm()
+                                                                .id(SharedString::from(format!(
+                                                                    "split-{step}"
+                                                                )))
+                                                                .w(px(240. / 20.))
+                                                                .h(px(18.))
                                                                 .cursor_pointer()
-                                                                .border_1()
-                                                                .border_color(rgb(0x505050))
-                                                                .bg(if selected {
-                                                                    rgb(0x5090d0)
-                                                                } else {
-                                                                    rgb(0x2a2a2a)
-                                                                })
-                                                                .hover(|style| style.bg(rgb(0x404040)))
                                                                 .on_click(listener)
                                                         },
                                                     )),
                                             )
-                                            .child(div().text_color(rgb(0x808080)).child("upscaled"))
+                                            .child(
+                                                div().text_color(rgb(0x808080)).child("upscaled"),
+                                            )
                                             .child(div().flex_1())
-                                            .child(toolbar_button("−", true, zoom_out))
-                                            .child(toolbar_button("+", true, zoom_in)),
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(rgb(0x808080))
+                                                    .child(format!("×{zoom:.0}")),
+                                            )
+                                            .child(toolbar_button("−", false, true, zoom_out))
+                                            .child(toolbar_button("+", false, true, zoom_in)),
                                     ),
                             )
                             .when(show_3d, |this| {
@@ -1433,17 +1565,11 @@ impl Render for AppView {
                                                     )
                                                 }),
                                         )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                .gap_2()
-                                                .children(rotate_listeners.into_iter().map(
-                                                    |(_yaw, listener)| {
-                                                        toolbar_button("rotate", true, listener)
-                                                    },
-                                                )),
-                                        ),
+                                        .child(div().flex().flex_col().gap_2().children(
+                                            rotate_listeners.into_iter().map(|(_yaw, listener)| {
+                                                toolbar_button("Rotate", false, true, listener)
+                                            }),
+                                        )),
                                 )
                             }),
                     ),
@@ -1459,12 +1585,7 @@ impl Render for AppView {
                     .py_1()
                     .border_t_1()
                     .border_color(rgb(0x3c3c3c))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_color(rgb(0x9a9a9a))
-                            .child(status_line),
-                    )
+                    .child(div().flex_1().text_color(rgb(0x9a9a9a)).child(status_line))
                     .when(batch_total > 0, |this| {
                         this.child(
                             div()
@@ -1476,50 +1597,203 @@ impl Render for AppView {
                                 .child(
                                     div()
                                         .h_full()
-                                        .w(px(160.0 * batch_done as f32 / batch_total.max(1) as f32))
+                                        .w(
+                                            px(160.0 * batch_done as f32
+                                                / batch_total.max(1) as f32),
+                                        )
                                         .bg(rgb(0x5090d0)),
                                 ),
                         )
                     })
                     .when(batch_running, |this| {
-                        this.child(toolbar_button("Cancel", true, cancel_batch))
+                        this.child(toolbar_button("Cancel", false, true, cancel_batch))
                     }),
             )
     }
 }
 
+/// A button in the toolbar.
+///
+/// `selected` marks the button of the setting that is in use, `enabled` says
+/// whether the button can be pressed at all.
 fn toolbar_button(
     label: impl Into<SharedString>,
+    selected: bool,
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> Stateful<Div> {
     let label = label.into();
     let id = SharedString::from(format!("btn-{label}"));
+
+    let background = if selected {
+        rgb(0x3c6ea8)
+    } else if enabled {
+        rgb(0x2e2e2e)
+    } else {
+        rgb(0x242424)
+    };
+    let text = if selected {
+        rgb(0xffffff)
+    } else if enabled {
+        rgb(0xd6d6d6)
+    } else {
+        rgb(0x636363)
+    };
+
     let button = div()
         .id(id)
         .px_2()
         .py_1()
         .rounded_sm()
         .border_1()
-        .border_color(rgb(0x5a5a5a))
-        .bg(rgb(0x3c3c3c))
-        .text_color(rgb(0xe8e8e8));
+        .border_color(if selected {
+            rgb(0x5b93d4)
+        } else {
+            rgb(0x3a3a3a)
+        })
+        .bg(background)
+        .text_color(text)
+        .child(label);
 
     if enabled {
         button
             .cursor_pointer()
-            .hover(|style| style.bg(rgb(0x4a4a4a)))
+            .hover(|style| {
+                style.bg(if selected {
+                    rgb(0x4a80c0)
+                } else {
+                    rgb(0x3a3a3a)
+                })
+            })
             .on_click(on_click)
     } else {
-        button.text_color(rgb(0x6a6a6a))
+        button
     }
 }
 
-fn stitch_toggle(
-    enabled: bool,
-    has_model: bool,
+/// A group of buttons with a small caption above them.
+fn toolbar_group(label: &str, items: Vec<impl IntoElement>) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .max_w(px(460.))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x767676))
+                .child(label.to_uppercase()),
+        )
+        .child(div().flex().flex_row().flex_wrap().gap_1().children(items))
+}
+
+/// The screen that is shown when nothing is open yet.
+fn welcome_panel(
+    open_texture: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    open_jar: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .px_4()
+        .child(
+            div()
+                .text_2xl()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(0xf2f2f2))
+                .child("XBR Studio"),
+        )
+        .child(
+            div()
+                .text_lg()
+                .text_color(rgb(0xa8a8a8))
+                .child("Minecraft textures, upscaled properly"),
+        )
+        .child(
+            div()
+                .mt_2()
+                .text_sm()
+                .text_color(rgb(0x7c7c7c))
+                .text_center()
+                .max_w(px(520.))
+                .child(
+                    "Open a texture to see it next to its upscaled version, or open a client jar to build a whole resource pack.",
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .mt_3()
+                .child(primary_button("Open texture…", open_texture))
+                .child(primary_button("Open jar…", open_jar)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .justify_center()
+                .gap_3()
+                .mt_4()
+                .text_xs()
+                .text_color(rgb(0x636363))
+                .child("xBRZ keeps the pixel art crisp")
+                .child("the faces of a block are stitched together")
+                .child("animated textures stay animated")
+                .child("the pack can be zipped and installed"),
+        )
+}
+
+/// A button that stands out, for the things worth doing first.
+fn primary_button(
+    label: impl Into<SharedString>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    let label = label.into();
+    div()
+        .id(SharedString::from(format!("primary-{label}")))
+        .px_3()
+        .py_2()
+        .rounded_sm()
+        .bg(rgb(0x3c6ea8))
+        .text_color(rgb(0xffffff))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(0x4a80c0)))
+        .on_click(on_click)
+        .child(label)
+}
+
+/// The zoom that makes a texture fill the canvas.
+fn fit_zoom(width: u32, height: u32) -> f32 {
+    // The size of the canvas without the bars around it.
+    const CANVAS_WIDTH: f32 = 1100.;
+    const CANVAS_HEIGHT: f32 = 520.;
+    let width = width.max(1) as f32;
+    let height = height.max(1) as f32;
+    (CANVAS_WIDTH / width)
+        .min(CANVAS_HEIGHT / height)
+        .clamp(1.0, 32.0)
+}
+
+/// A short note in the middle of the canvas.
+fn hint_panel(text: &str) -> impl IntoElement {
+    div()
+        .text_sm()
+        .text_color(rgb(0x5f5f5f))
+        .child(text.to_string())
+}
+
+fn stitch_toggle(
+    stitch: bool,
+    has_model: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let on = stitch && has_model;
     let row = div()
         .id("stitch-toggle")
         .flex()
@@ -1530,26 +1804,41 @@ fn stitch_toggle(
         .py_1()
         .rounded_sm()
         .border_1()
-        .border_color(rgb(0x5a5a5a))
-        .bg(rgb(0x3c3c3c))
-        .child(box_el())
+        .border_color(if on { rgb(0x5b93d4) } else { rgb(0x3a3a3a) })
+        .bg(if on { rgb(0x3c6ea8) } else { rgb(0x2e2e2e) })
+        .text_color(if has_model {
+            rgb(0xd6d6d6)
+        } else {
+            rgb(0x636363)
+        })
+        .child(check_box(on))
         .child("Stitch faces");
 
-    if enabled && has_model {
+    if has_model {
         row.cursor_pointer()
-            .hover(|style| style.bg(rgb(0x4a4a4a)))
+            .hover(|style| style.bg(rgb(0x3a3a3a)))
             .on_click(on_click)
     } else {
-        row.text_color(rgb(0x6a6a6a))
+        row
     }
 }
 
-fn box_el() -> impl IntoElement {
+/// A small square that is filled when the setting is on.
+fn check_box(checked: bool) -> impl IntoElement {
     div()
         .w(px(12.))
         .h(px(12.))
         .border_1()
-        .border_color(rgb(0x909090))
+        .border_color(if checked {
+            rgb(0xd6e6fa)
+        } else {
+            rgb(0x8a8a8a)
+        })
+        .bg(if checked {
+            rgb(0xd6e6fa)
+        } else {
+            rgb(0x1a1a1a)
+        })
         .rounded_sm()
 }
 
